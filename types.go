@@ -1,8 +1,10 @@
 // File    : types.go
-// Version : 1.0.0
-// Modified: 2026-04-01 12:00 UTC
+// Version : 1.2.0
+// Modified: 2026-04-01 18:00 UTC
 //
 // Changes:
+//   v1.2.0 - 2026-04-01 - Removed Postponed; added RDAPSkipped to ValidationResult
+//   v1.1.0 - 2026-04-01 - Added Throttled to RDAPResult; Postponed to ValidationResult
 //   v1.0.0 - 2026-04-01 - Initial implementation
 //
 // Summary: Core types, constants, and score weights shared across
@@ -43,10 +45,11 @@ const (
 
 // Score weights per source. Max attainable is ScoreMax (250).
 // Weights match the spec exactly:
-//   TOP_N          50  — presence in a well-known popularity list
-//   RDAP           50  — registry confirms active registration
-//   DNS_DELEGATION 50  — zone is delegated (NS records exist)
-//   DNS_RESOLUTION 100 — apex actually resolves to an IP (A or AAAA)
+//
+//	TOP_N          50  — presence in a well-known popularity list
+//	RDAP           50  — registry confirms active registration
+//	DNS_DELEGATION 50  — zone is delegated (NS records exist)
+//	DNS_RESOLUTION 100 — apex actually resolves to an IP (A or AAAA)
 const (
 	ScoreTopN          = 50
 	ScoreRDAP          = 50
@@ -81,9 +84,15 @@ type ValidationResult struct {
 	TopNRank int // 1-based rank; 0 = not in list
 
 	// RDAP / WHOIS check.
-	RDAPActive bool
-	RDAPStatus string    // Raw status string(s) from the RDAP JSON response
-	RDAPExpiry time.Time // Expiry date parsed from RDAP events (zero if unknown)
+	// When RDAPSkipped is true the three fields below are zero/false — the RDAP
+	// registry host was in a throttle backoff window so the check was not attempted.
+	// DNS and TOP-N still ran normally; the domain can still reach ACTIVE without
+	// RDAP. The throttle window will have expired by the next revalidation cycle,
+	// at which point RDAP will run and potentially add its 50-point contribution.
+	RDAPSkipped bool
+	RDAPActive  bool
+	RDAPStatus  string    // Raw status string(s) from the RDAP JSON response
+	RDAPExpiry  time.Time // Expiry date parsed from RDAP events (zero if unknown)
 
 	// DNS delegation check — NS records for the apex.
 	HasNS     bool
@@ -99,6 +108,8 @@ type ValidationResult struct {
 	Sources []ValidationSource
 
 	// Non-fatal errors from any validator; a domain can partially validate.
+	// When RDAPSkipped is true, contains a single informational "rdap: skipped
+	// (throttled)" entry — this does not block scoring or store persistence.
 	Errors []string
 }
 

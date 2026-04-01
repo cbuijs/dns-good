@@ -1,14 +1,16 @@
 // File    : store.go
-// Version : 1.0.0
-// Modified: 2026-04-01 12:00 UTC
+// Version : 1.1.0
+// Modified: 2026-04-01 19:00 UTC
 //
 // Changes:
+//   v1.1.0 - 2026-04-01 - Removed extractApex; moved to apex.go (PSL-backed)
 //   v1.0.0 - 2026-04-01 - Initial implementation
 //
 // Summary: SQLite-backed domain repository. Handles all persistence,
 //          staleness management, and bulk queries. WAL journal mode
 //          allows concurrent reads; SetMaxOpenConns(1) serialises writes.
 //          Pure-Go driver (modernc.org/sqlite) — no CGO required.
+//          extractApex lives in apex.go — do not redeclare it here.
 
 package main
 
@@ -348,39 +350,12 @@ func scanEntries(rows *sql.Rows) ([]*DomainEntry, error) {
 		); err != nil {
 			return nil, err
 		}
-		if firstSeen.Valid  { e.FirstSeen  = firstSeen.Time  }
-		if lastActive.Valid { e.LastActive = lastActive.Time }
-		if lastChecked.Valid{ e.LastChecked= lastChecked.Time}
+		if firstSeen.Valid   { e.FirstSeen   = firstSeen.Time   }
+		if lastActive.Valid  { e.LastActive  = lastActive.Time  }
+		if lastChecked.Valid { e.LastChecked = lastChecked.Time }
 		_ = json.Unmarshal([]byte(srcJSON), &e.Sources)
 		out = append(out, e)
 	}
 	return out, rows.Err()
-}
-
-// extractApex derives the registered/apex domain from a FQDN.
-// Uses a small built-in table for common compound TLDs (co.uk, com.au, etc.).
-// For full accuracy with all ccTLDs, swap this for a Public Suffix List library.
-func extractApex(domain string) string {
-	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
-	parts := strings.Split(domain, ".")
-	if len(parts) <= 2 {
-		return domain
-	}
-	// Compound TLDs where the apex needs 3 labels.
-	compound := map[string]bool{
-		"co.uk": true, "org.uk": true, "me.uk": true, "net.uk": true,
-		"com.au": true, "net.au": true, "org.au": true,
-		"co.nz": true, "net.nz": true, "org.nz": true,
-		"co.za": true, "org.za": true,
-		"co.jp": true, "or.jp": true, "ne.jp": true,
-		"com.br": true, "net.br": true, "org.br": true,
-		"com.mx": true, "net.mx": true,
-		"com.ar": true, "net.ar": true,
-	}
-	last2 := parts[len(parts)-2] + "." + parts[len(parts)-1]
-	if compound[last2] && len(parts) >= 3 {
-		return strings.Join(parts[len(parts)-3:], ".")
-	}
-	return strings.Join(parts[len(parts)-2:], ".")
 }
 

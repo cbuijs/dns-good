@@ -1,8 +1,12 @@
 // File    : main.go
-// Version : 1.3.0
-// Modified: 2026-04-01 18:00 UTC
+// Version : 1.5.0
+// Modified: 2026-04-01 20:00 UTC
 //
 // Changes:
+//   v1.5.0 - 2026-04-01 - Graceful shutdown via context: Ctrl-C finishes in-flight
+//                          work, always exports and closes DB cleanly; second signal
+//                          force-exits immediately
+//   v1.4.0 - 2026-04-01 - Wire up RootZone; pass it to NewResolver
 //   v1.3.0 - 2026-04-01 - Added -db flag to override db.path from config
 //   v1.2.0 - 2026-04-01 - Added -reset flag to wipe DB and output dir before a run
 //   v1.1.0 - 2026-04-01 - Added -output and -verbose flags; verbose threaded through
@@ -15,6 +19,12 @@
 //            run    — continuous revalidation loop (daemon mode)
 //            stats  — print repository statistics and exit
 //
+//          Graceful shutdown: SIGINT/SIGTERM cancels a shared context that
+//          flows through RunBatch. New goroutines stop being launched; any
+//          domain already in-flight finishes normally. ExportLists and
+//          store.Close always run on the way out — the DB and output files
+//          are always consistent. A second signal force-exits immediately.
+//
 //          Build:  go build -o dns-good .
 //          Usage:  ./dns-good -help
 
@@ -22,6 +32,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -43,6 +54,7 @@ func main() {
 	dbPath     := flag.String("db",      "",            "Override database file path from config (empty = use config)")
 	reset      := flag.Bool(  "reset",   false,         "Wipe the database and output directory before running (fresh start)")
 	batch      := flag.Int(   "batch",    0,            "Max domains to validate per run (0 = unlimited)")
+
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `dns-good — DNS domain validation repository
 
@@ -64,6 +76,26 @@ Modes:
 `)
 	}
 	flag.Parse()
+
+	// --- Graceful shutdown context ---
+	// A single context covers all modes. The signal goroutine cancels it on the
+	// first SIGINT/SIGTERM; RunBatch checks it before launching each new domain
+	// goroutine. In-flight work finishes normally; ExportLists and store.Close
+	// always run via the deferred calls below. A second signal force-exits.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 2) // buffered 2 so the second signal never blocks
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Printf("signal %s received — finishing in-flight work then exiting cleanly (send again to force)", sig)
+		cancel() // unblocks ctx.Done() in RunBatch
+		// Second signal: skip the clean path and exit immediately.
+		sig = <-sigCh
+		log.Printf("second signal %s received — forcing exit now", sig)
+		os.Exit(1)
+	}()
 
 	// --- Config ---
 	cfg, err := LoadConfig(*configPath)
@@ -98,12 +130,22 @@ Modes:
 	if err != nil {
 		log.Fatalf("store: %v", err)
 	}
-	defer store.Close()
+	// Close is deferred here so it always runs — normal exit, signal, or panic.
+	defer func() {
+		log.Println("shutdown: closing database")
+		store.Close()
+	}()
 
 	// Long-lived components — created once and reused across every run cycle.
-	// This keeps the Tranco TOP-N map, RDAP bootstrap, and DNS client state
-	// in memory between runs instead of re-parsing from disk each time.
-	resolver := NewResolver(cfg.DNS.MaxDepth, cfg.DNS.Retries, cfg.DNS.Timeout)
+	// This keeps the Tranco TOP-N map, RDAP bootstrap, root zone cache, and
+	// DNS client state in memory between runs instead of re-initialising from
+	// disk each time.
+	rootZone := NewRootZone(cfg)
+	if err := rootZone.Ensure(); err != nil {
+		// Non-fatal — the resolver falls back to normal root-server behaviour.
+		log.Printf("rootzone: load failed (%v) — falling back to root servers", err)
+	}
+	resolver := NewResolver(cfg.DNS.MaxDepth, cfg.DNS.Retries, cfg.DNS.Timeout, rootZone)
 	rdap     := NewRDAPClient(cfg)
 	topn     := NewTopN(cfg)
 
@@ -118,14 +160,10 @@ Modes:
 		// Input file is optional — without one we still revalidate any
 		// STALE/UNKNOWN entries that are already in the store.
 		domains := loadDomains(*inputFile)
-		runCheck(cfg, store, resolver, rdap, topn, domains, *verbose, *batch)
+		runCheck(ctx, cfg, store, resolver, rdap, topn, domains, *verbose, *batch)
 
 	// ------------------------------------------------------------------
 	case "run":
-		// Graceful shutdown on SIGINT / SIGTERM.
-		stop := make(chan os.Signal, 1)
-		signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-
 		domains := loadDomains(*inputFile)
 
 		log.Printf("dns-good running in daemon mode (workers=%d, stale_ttl=%s, delay=%s)",
@@ -140,15 +178,22 @@ Modes:
 			}
 
 			if len(domains) > 0 {
-				runCheck(cfg, store, resolver, rdap, topn, domains, *verbose, *batch)
+				runCheck(ctx, cfg, store, resolver, rdap, topn, domains, *verbose, *batch)
 			} else {
-				runStaleRevalidation(cfg, store, resolver, rdap, topn, *verbose, *batch)
+				runStaleRevalidation(ctx, cfg, store, resolver, rdap, topn, *verbose, *batch)
+			}
+
+			// If context was cancelled during the run above, exit the loop
+			// now rather than sleeping — export and DB close happen via defer.
+			if ctx.Err() != nil {
+				log.Println("shutdown: exiting run loop")
+				return
 			}
 
 			log.Printf("sleeping %s until next cycle", cfg.Validation.RevalidateDelay)
 			select {
-			case <-stop:
-				log.Println("shutdown signal received — bye!")
+			case <-ctx.Done():
+				log.Println("shutdown: sleep interrupted — exiting cleanly")
 				return
 			case <-time.After(cfg.Validation.RevalidateDelay):
 			}
@@ -162,7 +207,9 @@ Modes:
 
 // runCheck adds the supplied domains to the store (skipping fresh-active ones),
 // then validates every UNKNOWN/STALE entry using the worker pool.
-func runCheck(cfg *Config, store *Store, resolver *Resolver, rdap *RDAPClient, topn *TopN, domains []string, verbose bool, batch int) {
+// Always calls ExportLists at the end — even when ctx was cancelled mid-batch,
+// so the output files reflect everything that was completed before the signal.
+func runCheck(ctx context.Context, cfg *Config, store *Store, resolver *Resolver, rdap *RDAPClient, topn *TopN, domains []string, verbose bool, batch int) {
 	if len(domains) > 0 {
 		filtered, err := store.FilterNewOrStale(domains, cfg.Validation.StaleTTL)
 		if err != nil {
@@ -185,18 +232,24 @@ func runCheck(cfg *Config, store *Store, resolver *Resolver, rdap *RDAPClient, t
 	}
 
 	v := NewValidator(cfg, store, resolver, rdap, topn, verbose)
-	results := v.RunBatch(batch)
-	if results == 0 {
+	results := v.RunBatch(ctx, batch)
+	switch {
+	case results == 0:
 		log.Println("nothing to validate — store is fully up-to-date")
-	} else {
+	case ctx.Err() != nil:
+		log.Printf("validated %d domain(s) before shutdown — exporting partial results", results)
+	default:
 		log.Printf("validated %d domain(s)", results)
 	}
+	// Export always runs — partial results from an interrupted batch are still
+	// valid and should be reflected in the output files immediately.
 	ExportLists(cfg, store)
 }
 
-func runStaleRevalidation(cfg *Config, store *Store, resolver *Resolver, rdap *RDAPClient, topn *TopN, verbose bool, batch int) {
+// runStaleRevalidation validates STALE/UNKNOWN entries without a new input list.
+func runStaleRevalidation(ctx context.Context, cfg *Config, store *Store, resolver *Resolver, rdap *RDAPClient, topn *TopN, verbose bool, batch int) {
 	v := NewValidator(cfg, store, resolver, rdap, topn, verbose)
-	results := v.RunBatch(batch)
+	results := v.RunBatch(ctx, batch)
 	if results > 0 {
 		log.Printf("revalidated %d domain(s)", results)
 	}
@@ -218,7 +271,7 @@ func doReset(cfg *Config) {
 	}
 	log.Printf("reset: removed database %s", cfg.DB.Path)
 
-	// Remove and recreate the output directory so stale text files are gone.
+	// Remove the output directory so stale text files are gone.
 	if cfg.Output.Dir != "" {
 		if err := os.RemoveAll(cfg.Output.Dir); err != nil && !os.IsNotExist(err) {
 			log.Fatalf("reset: remove output dir %s: %v", cfg.Output.Dir, err)

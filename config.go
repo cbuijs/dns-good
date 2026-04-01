@@ -1,8 +1,10 @@
 // File    : config.go
-// Version : 1.2.0
-// Modified: 2026-04-01 16:00 UTC
+// Version : 1.4.0
+// Modified: 2026-04-01 19:00 UTC
 //
 // Changes:
+//   v1.4.0 - 2026-04-01 - Added RootZone config section
+//   v1.3.0 - 2026-04-01 - Added RDAP.ThrottleBackoff (default 5m)
 //   v1.2.0 - 2026-04-01 - Added MinActiveScore (default 100)
 //   v1.1.0 - 2026-04-01 - Added Output.Dir
 //   v1.0.0 - 2026-04-01 - Initial implementation
@@ -31,7 +33,7 @@ type Config struct {
 		StaleTTL        time.Duration `yaml:"stale_ttl"`
 		RevalidateDelay time.Duration `yaml:"revalidate_delay"`
 		Timeout         time.Duration `yaml:"timeout"`
-		MinActiveScore  int           `yaml:"min_active_score"` // minimum score required for ACTIVE status
+		MinActiveScore  int           `yaml:"min_active_score"`
 	} `yaml:"validation"`
 
 	DNS struct {
@@ -42,15 +44,27 @@ type Config struct {
 	} `yaml:"dns"`
 
 	RDAP struct {
-		BootstrapURL string        `yaml:"bootstrap_url"`
-		CachePath    string        `yaml:"cache_path"`
-		CacheTTL     time.Duration `yaml:"cache_ttl"`
-		Timeout      time.Duration `yaml:"timeout"`
-		MinGapMs     int           `yaml:"min_gap_ms"` // ms between requests to the same RDAP host
+		BootstrapURL    string        `yaml:"bootstrap_url"`
+		CachePath       string        `yaml:"cache_path"`
+		CacheTTL        time.Duration `yaml:"cache_ttl"`
+		Timeout         time.Duration `yaml:"timeout"`
+		MinGapMs        int           `yaml:"min_gap_ms"`
+		ThrottleBackoff time.Duration `yaml:"throttle_backoff"`
 	} `yaml:"rdap"`
 
+	// RootZone enables the IANA root zone optimisation:
+	//   - skip the root server hop for any TLD with in-zone glue
+	//   - fast NXDOMAIN for domains whose TLD is not in the root zone
+	// Disable only if the root zone download is blocked in your environment.
+	RootZone struct {
+		Enabled    bool          `yaml:"enabled"`
+		URL        string        `yaml:"url"`
+		CachePath  string        `yaml:"cache_path"`
+		RefreshTTL time.Duration `yaml:"refresh_ttl"`
+	} `yaml:"rootzone"`
+
 	Output struct {
-		Dir string `yaml:"dir"` // write status text files here; empty = disabled
+		Dir string `yaml:"dir"`
 	} `yaml:"output"`
 
 	TopN struct {
@@ -63,72 +77,64 @@ type Config struct {
 }
 
 // newDefaultConfig returns a fully populated Config with production-ready defaults.
-// Every field here has a matching entry (and explanation) in config.yaml.
 func newDefaultConfig() *Config {
 	c := &Config{}
 
 	c.DB.Path = "dns-good.db"
 
-	c.Validation.Workers = 20
-	c.Validation.StaleTTL = 24 * time.Hour
+	c.Validation.Workers         = 20
+	c.Validation.StaleTTL        = 24 * time.Hour
 	c.Validation.RevalidateDelay = 4 * time.Hour
-	c.Validation.Timeout = 15 * time.Second
-	c.Validation.MinActiveScore = 100 // DNS_DELEGATION (50) + any one other source
+	c.Validation.Timeout         = 15 * time.Second
+	c.Validation.MinActiveScore  = 100
 
-	// All 13 IANA root servers. We pick one at random per resolution
-	// to spread load naturally across the anycast clusters.
 	c.DNS.RootServers = []string{
-		"198.41.0.4",     // a.root-servers.net
-		"170.247.170.2",  // b.root-servers.net
-		"192.33.4.12",    // c.root-servers.net
-		"199.7.91.13",    // d.root-servers.net
-		"192.203.230.10", // e.root-servers.net
-		"192.5.5.241",    // f.root-servers.net
-		"192.112.36.4",   // g.root-servers.net
-		"198.97.190.53",  // h.root-servers.net
-		"192.36.148.17",  // i.root-servers.net
-		"192.58.128.30",  // j.root-servers.net
-		"193.0.14.129",   // k.root-servers.net
-		"199.7.83.42",    // l.root-servers.net
-		"202.12.27.33",   // m.root-servers.net
+		"198.41.0.4", "170.247.170.2", "192.33.4.12", "199.7.91.13",
+		"192.203.230.10", "192.5.5.241", "192.112.36.4", "198.97.190.53",
+		"192.36.148.17", "192.58.128.30", "193.0.14.129", "199.7.83.42",
+		"202.12.27.33",
 	}
 	c.DNS.MaxDepth = 12
-	c.DNS.Retries = 2
-	c.DNS.Timeout = 5 * time.Second
+	c.DNS.Retries  = 2
+	c.DNS.Timeout  = 5 * time.Second
 
-	c.RDAP.BootstrapURL = "https://data.iana.org/rdap/dns.json"
-	c.RDAP.CachePath = "rdap-bootstrap.json"
-	c.RDAP.CacheTTL = 48 * time.Hour
-	c.RDAP.Timeout = 10 * time.Second
-	c.RDAP.MinGapMs = 500 // ~2 req/s per RDAP host
+	c.RDAP.BootstrapURL    = "https://data.iana.org/rdap/dns.json"
+	c.RDAP.CachePath       = "rdap-bootstrap.json"
+	c.RDAP.CacheTTL        = 48 * time.Hour
+	c.RDAP.Timeout         = 10 * time.Second
+	c.RDAP.MinGapMs        = 500
+	c.RDAP.ThrottleBackoff = 5 * time.Minute
 
-	c.Output.Dir = "output" // write active/inactive/stale/unknown.txt here
+	c.RootZone.Enabled    = true
+	c.RootZone.URL        = "https://www.internic.net/domain/root.zone"
+	c.RootZone.CachePath  = "root.zone"
+	c.RootZone.RefreshTTL = 24 * time.Hour
 
-	c.TopN.Provider = "tranco"
-	c.TopN.URL = "https://tranco-list.eu/top-1m.csv.zip"
-	c.TopN.CachePath = "tranco.csv"
+	c.Output.Dir = "output"
+
+	c.TopN.Provider   = "tranco"
+	c.TopN.URL        = "https://tranco-list.eu/top-1m.csv.zip"
+	c.TopN.CachePath  = "tranco.csv"
 	c.TopN.RefreshTTL = 24 * time.Hour
-	c.TopN.Size = 1_000_000
+	c.TopN.Size       = 1_000_000
 
 	return c
 }
 
-// LoadConfig loads a YAML config from path and merges it onto the defaults.
-// If path is empty or the file doesn't exist, pure defaults are returned.
+// LoadConfig reads path into a Config, falling back gracefully to defaults
+// when the file does not exist or a field is absent from the YAML.
 func LoadConfig(path string) (*Config, error) {
 	cfg := newDefaultConfig()
-	if path == "" {
+
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
 		return cfg, nil
 	}
-	f, err := os.Open(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return cfg, nil // no config file is perfectly fine
-		}
 		return nil, err
 	}
-	defer f.Close()
-	if err := yaml.NewDecoder(f).Decode(cfg); err != nil {
+
+	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, err
 	}
 	return cfg, nil

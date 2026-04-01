@@ -1,10 +1,12 @@
 // File    : resolver.go
-// Version : 1.1.0
-// Modified: 2026-04-01 20:00 UTC
+// Version : 1.2.0
+// Modified: 2026-04-01 19:00 UTC
 //
 // Changes:
+//   v1.2.0 - 2026-04-01 - Root zone integration: skip root hop for known TLDs;
+//                          fast NXDOMAIN on unknown TLDs; extractTLD moved to apex.go
 //   v1.1.0 - 2026-04-01 - SERVFAIL from one server no longer kills resolution;
-//                          other servers in the set are tried first.
+//                          other servers in the set are tried first
 //   v1.0.0 - 2026-04-01 - Initial implementation
 //
 // Summary: Self-contained iterative DNS resolver. Walks the delegation
@@ -14,21 +16,21 @@
 //          HOW IT WORKS — two completely different modes, don't confuse them:
 //
 //          ITERATIVE (used for target domains):
-//            We do the work. Ask root → get TLD referral → ask TLD → get NS
-//            referral → ask authoritative NS → get final answer. Each hop is
-//            a separate query from us. RecursionDesired = false on all of them.
-//            This is what iterativeResolve() does.
+//            We do the work. Start from root (or TLD NS if root zone cache
+//            has glue) → follow NS referrals → get final answer.
+//            RecursionDesired = false on all queries.
 //
 //          RECURSIVE (used only for glueless NS hostnames):
-//            We delegate the work. Ask 8.8.8.8 "give me the final answer" and
-//            it walks the chain for us. RecursionDesired = true. Used only in
-//            resolveNStoIPs() when a referral has no glue records — a pragmatic
+//            We delegate the work to a public resolver. RecursionDesired = true.
+//            Used only when a referral has no glue records — a pragmatic
 //            trade-off for NS infrastructure hostnames only.
 //
-//          The one-server-SERVFAIL bug: query() now treats SERVFAIL as a soft
-//          per-server failure and tries the next server in the set. Previously,
-//          SERVFAIL from whichever server happened to be picked first would
-//          abort the entire resolution, even if the other 3 NS servers were fine.
+//          ROOT ZONE OPTIMISATION:
+//            When a RootZone is provided and has glue IPs for a TLD, the root
+//            server query is skipped entirely — we start directly at the TLD
+//            nameservers. Three queries are saved per domain (NS + A + AAAA
+//            each start from root in the normal path). Unknown TLDs (not in
+//            root zone) get an immediate NXDOMAIN without any network round trip.
 
 package main
 
@@ -63,7 +65,7 @@ var ianaRootServers = []string{
 
 // publicFallbackResolvers is used ONLY to resolve NS hostnames when no
 // glue records are present in a referral (glueless delegation).
-// These are NOT used for the target domains themselves.
+// These are NOT used for target domains themselves.
 var publicFallbackResolvers = []string{
 	"1.1.1.1:53", // Cloudflare
 	"8.8.8.8:53", // Google
@@ -93,24 +95,24 @@ type Resolver struct {
 	retries  int
 	udp      *dns.Client // primary transport
 	tcp      *dns.Client // fallback for truncated UDP responses
+	rootZone *RootZone   // optional; nil disables root zone optimisation
 }
 
 // NewResolver creates a Resolver with the given settings.
-func NewResolver(maxDepth, retries int, timeout time.Duration) *Resolver {
+// rz may be nil — root zone optimisation is simply disabled when not provided.
+func NewResolver(maxDepth, retries int, timeout time.Duration, rz *RootZone) *Resolver {
 	return &Resolver{
 		maxDepth: maxDepth,
 		retries:  retries,
 		udp:      &dns.Client{Net: "udp", Timeout: timeout},
 		tcp:      &dns.Client{Net: "tcp", Timeout: timeout * 2},
+		rootZone: rz,
 	}
 }
 
 // CheckDomain runs a full iterative check for an apex domain:
 //  1. Resolves NS records (confirms zone delegation exists).
-//  2. Resolves A and AAAA records from those authoritative servers.
-//
-// Only the apex domain should be passed here; subdomain A/AAAA checks
-// are separate and caller-driven if needed.
+//  2. Resolves A and AAAA records for the apex from those authoritative servers.
 func (r *Resolver) CheckDomain(apex string) *ResolveResult {
 	res := &ResolveResult{}
 	fqdn := dns.Fqdn(strings.ToLower(apex))
@@ -121,10 +123,8 @@ func (r *Resolver) CheckDomain(apex string) *ResolveResult {
 		if !isNXDomain(err) {
 			res.Errors = append(res.Errors, "NS: "+err.Error())
 		}
-		// NXDOMAIN → HasNS stays false, which is the correct result
+		// NXDOMAIN → HasNS stays false — correct result
 	} else {
-		// NS records can appear in Answer (authoritative response) or Ns
-		// (referral / authority section) depending on which server answered.
 		for _, rr := range append(nsResp.Answer, nsResp.Ns...) {
 			if ns, ok := rr.(*dns.NS); ok {
 				res.HasNS = true
@@ -162,23 +162,23 @@ func (r *Resolver) CheckDomain(apex string) *ResolveResult {
 	return res
 }
 
-// iterativeResolve walks the DNS hierarchy from a root server, following NS
-// referrals at each level, until it gets an authoritative answer for name/qtype.
+// iterativeResolve walks the DNS hierarchy from root (or TLD when root zone
+// cache has glue), following NS referrals at each level, until it gets an
+// authoritative answer for name/qtype.
 //
-// The walk: root → TLD → authoritative NS → answer. At each step we send a
-// non-recursive query (RD=false) and handle whatever comes back:
-//
-//   Answer section present   → done (or follow CNAME and restart)
-//   AA bit set, Answer empty → NODATA (record type absent, domain exists)
-//   Authority section NS     → referral; resolve those NS IPs and continue
-//   NXDOMAIN rcode           → domain does not exist anywhere in the tree
-//   SERVFAIL rcode           → tried all servers, all reported failure
+// Root zone shortcut: when r.rootZone is set and has glue IPs for name's TLD,
+// the first hop (root → TLD NS) is skipped — we start directly at the TLD
+// nameservers. Unknown TLDs return NXDomainError immediately.
 //
 // CNAME chains are followed up to 8 hops by restarting the walk for the target.
+// Each restart also benefits from the root zone cache for its own TLD.
 func (r *Resolver) iterativeResolve(name string, qtype uint16) (*dns.Msg, error) {
-	servers := []string{randomRootServer() + ":53"}
-	cnameHops := 0
+	servers, err := r.startingServers(name)
+	if err != nil {
+		return nil, err // unknown TLD
+	}
 
+	cnameHops := 0
 	for depth := 0; depth < r.maxDepth; depth++ {
 		resp, err := r.query(name, qtype, servers)
 		if err != nil {
@@ -186,43 +186,43 @@ func (r *Resolver) iterativeResolve(name string, qtype uint16) (*dns.Msg, error)
 		}
 
 		switch resp.Rcode {
-		case dns.RcodeNameError: // NXDOMAIN — domain does not exist
+		case dns.RcodeNameError: // NXDOMAIN
 			return nil, &NXDomainError{Name: name}
 		case dns.RcodeServerFailure:
-			// query() only returns SERVFAIL here if ALL servers in the set
-			// returned SERVFAIL — individual server failures are retried
-			// against the other servers in the set before reaching this point.
+			// query() only surfaces SERVFAIL here when ALL servers in the
+			// current set returned it — single-server failures are silently
+			// retried against the other servers in the set.
 			return nil, fmt.Errorf("SERVFAIL for %s (all authoritative servers failed)", name)
 		}
 
-		// Answer section present — we have a result.
 		if len(resp.Answer) > 0 {
-			// If there's a CNAME and we're not specifically hunting for CNAMEs,
-			// restart the walk from root for the canonical target name.
+			// Follow CNAME chains unless we're specifically querying for CNAME.
 			if qtype != dns.TypeCNAME {
 				if target := extractCNAMETarget(resp); target != "" {
 					if cnameHops >= 8 {
 						return nil, fmt.Errorf("CNAME chain too deep for %s", name)
 					}
-					name = dns.Fqdn(target)
-					servers = []string{randomRootServer() + ":53"}
+					name = dns.Fqdn(strings.ToLower(target))
 					cnameHops++
-					depth = -1 // post-increment makes this 0 at the top of next iteration
+					depth = -1 // post-increment brings this to 0 at loop top
+					// Restart walk from root (or TLD NS) for the CNAME target.
+					servers, err = r.startingServers(name)
+					if err != nil {
+						return nil, err
+					}
 					continue
 				}
 			}
 			return resp, nil
 		}
 
-		// AA bit set with empty Answer = NODATA: record type doesn't exist
-		// but the domain itself does. Return the response so the caller can
-		// inspect the Authority section (often contains SOA or NS).
+		// AA=true, empty Answer → NODATA (type absent, domain exists).
+		// Return so the caller can inspect the Authority section.
 		if resp.Authoritative {
 			return resp, nil
 		}
 
-		// Non-authoritative, no Answer → referral. The Authority section has
-		// the NS names for the next level; Additional has glue IPs (if any).
+		// Non-authoritative, no Answer → NS referral.
 		nsNames := extractNSNames(resp)
 		if len(nsNames) == 0 {
 			return nil, fmt.Errorf("no referral at depth %d for %s", depth, name)
@@ -238,60 +238,72 @@ func (r *Resolver) iterativeResolve(name string, qtype uint16) (*dns.Msg, error)
 	return nil, fmt.Errorf("max delegation depth %d exceeded for %s", r.maxDepth, name)
 }
 
-// query sends name/qtype to each server in shuffled order with UDP, falling
-// back to TCP on truncation.
+// startingServers returns the initial server list for iterativeResolve.
+// When the root zone cache has glue IPs for name's TLD, those are returned
+// directly (skipping the root hop). Falls back to a random root server
+// when root zone is disabled, not loaded, or has no glue for this TLD.
+// Returns NXDomainError when the root zone is loaded and the TLD is unknown.
+func (r *Resolver) startingServers(name string) ([]string, error) {
+	tld := extractTLD(name)
+	if r.rootZone != nil {
+		// Pre-flight: if the TLD doesn't exist in the root zone at all, no
+		// amount of querying will produce a result — fail fast.
+		if !r.rootZone.KnownTLD(tld) {
+			return nil, &NXDomainError{Name: name}
+		}
+		// Use TLD NS IPs from glue — one fewer hop per domain per query type.
+		if ips, ok := r.rootZone.NSForTLD(tld); ok {
+			return ips, nil
+		}
+		// TLD is known but has no in-zone glue (some ccTLDs use out-of-zone NS).
+		// Fall through to root server — we'll get the referral from there.
+	}
+	return []string{randomRootServer() + ":53"}, nil
+}
+
+// query sends name/qtype to each server in shuffled order with UDP,
+// falling back to TCP on truncation.
 //
-// SERVFAIL from a single server is a soft failure — we skip to the next server.
-// This is the fix for the one-bad-NS-kills-everything bug: in a typical setup
-// with 4 authoritative servers, one returning SERVFAIL should not abort the
-// entire resolution. Only if ALL servers return SERVFAIL (or time out) do we
-// propagate the failure to the caller.
+// SERVFAIL from a single server is treated as a soft failure: we move on to
+// the next server in the set. Only when ALL servers return SERVFAIL (or time
+// out) is the failure surfaced to the caller.
 func (r *Resolver) query(name string, qtype uint16, servers []string) (*dns.Msg, error) {
 	m := new(dns.Msg)
 	m.SetQuestion(name, qtype)
-	m.RecursionDesired = false // we follow referrals ourselves; never ask a server to recurse
-	m.SetEdns0(1232, false)    // EDNS0 buffer size per RFC 8085 recommendation
+	m.RecursionDesired = false // we walk the chain ourselves
+	m.SetEdns0(1232, false)    // RFC 8085 recommended buffer size
 
 	shuffled := make([]string, len(servers))
 	copy(shuffled, servers)
 	rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
 
 	var lastErr error
-	var servfailResp *dns.Msg // saved in case every server SERVFAILs
+	var servfailResp *dns.Msg
 
 	for _, srv := range shuffled {
 		for try := 0; try <= r.retries; try++ {
 			resp, _, err := r.udp.Exchange(m, srv)
 			if err != nil {
 				lastErr = err
-				continue // retry same server
+				continue
 			}
 			if resp.Truncated {
-				// UDP payload too large — retry this server over TCP.
 				resp, _, err = r.tcp.Exchange(m, srv)
 				if err != nil {
 					lastErr = err
-					continue // retry same server
+					continue
 				}
 			}
-
-			// SERVFAIL from this specific server — don't give up yet.
-			// Break the retry loop for this server and try the next one.
 			if resp.Rcode == dns.RcodeServerFailure {
 				lastErr = fmt.Errorf("SERVFAIL from %s for %s %s",
 					srv, name, dns.TypeToString[qtype])
 				servfailResp = resp
-				break // move to next server in outer loop
+				break // try next server
 			}
-
-			return resp, nil // success (NOERROR, NXDOMAIN, etc.)
+			return resp, nil
 		}
 	}
 
-	// Every server either timed out or returned SERVFAIL.
-	// Return the SERVFAIL response if we have one — the caller can inspect
-	// the Rcode directly and emit a useful error. Otherwise return the last
-	// transport error.
 	if servfailResp != nil {
 		return servfailResp, nil
 	}
@@ -300,8 +312,8 @@ func (r *Resolver) query(name string, qtype uint16, servers []string) (*dns.Msg,
 }
 
 // resolveNStoIPs maps NS hostnames to IP address strings.
-// Glue records from the referral are used first (no extra query needed).
-// For glueless delegations, falls back to public resolvers — see file header.
+// Glue records from the referral are used first; glueless delegations fall
+// back to a public recursive resolver (see file header for reasoning).
 // Capped at 4 NS servers to keep the number of lookups bounded.
 func (r *Resolver) resolveNStoIPs(names []string, glue map[string][]string) []string {
 	limit := 4
@@ -314,7 +326,6 @@ func (r *Resolver) resolveNStoIPs(names []string, glue map[string][]string) []st
 
 	for _, name := range names[:limit] {
 		if addrs, ok := glue[name]; ok {
-			// Glue present — use it directly, no extra query needed.
 			for _, ip := range addrs {
 				if !seen[ip] {
 					ips = append(ips, ip)
@@ -323,11 +334,7 @@ func (r *Resolver) resolveNStoIPs(names []string, glue map[string][]string) []st
 			}
 			continue
 		}
-
-		// No glue (glueless delegation) — ask a public recursive resolver.
-		// RD=true here is intentional: we're resolving DNS infrastructure
-		// hostnames, not target domains, so delegating to a public resolver
-		// is an acceptable trade-off (see file header for reasoning).
+		// Glueless — ask a public recursive resolver for NS hostname A records.
 		for _, pub := range publicFallbackResolvers {
 			m := new(dns.Msg)
 			m.SetQuestion(dns.Fqdn(name), dns.TypeA)
@@ -381,7 +388,7 @@ func extractNSNames(msg *dns.Msg) []string {
 }
 
 // extractGlue collects A and AAAA records from the Additional section,
-// keyed by hostname — these are glue records accompanying an NS referral.
+// keyed by hostname — these accompany NS referrals as glue records.
 func extractGlue(msg *dns.Msg) map[string][]string {
 	glue := make(map[string][]string)
 	for _, rr := range msg.Extra {
@@ -398,7 +405,7 @@ func extractGlue(msg *dns.Msg) map[string][]string {
 }
 
 // extractCNAMETarget returns the first CNAME target in the Answer section,
-// or empty string if none is present.
+// or empty string when none is present.
 func extractCNAMETarget(msg *dns.Msg) string {
 	for _, rr := range msg.Answer {
 		if c, ok := rr.(*dns.CNAME); ok {
@@ -408,13 +415,13 @@ func extractCNAMETarget(msg *dns.Msg) string {
 	return ""
 }
 
-// addPort appends ":port" to each IP string, wrapping IPv6 addresses in brackets.
+// addPort appends ":port" to each bare IP string.
+// IPv6 addresses are wrapped in brackets to produce valid dial strings.
 func addPort(ips []string, port string) []string {
 	out := make([]string, 0, len(ips))
 	for _, ip := range ips {
-		parsed := net.ParseIP(ip)
-		if parsed != nil && parsed.To4() == nil {
-			out = append(out, "["+ip+"]:"+port) // IPv6
+		if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
+			out = append(out, "["+ip+"]:"+port)
 		} else {
 			out = append(out, ip+":"+port)
 		}

@@ -1,8 +1,10 @@
 // File    : progress.go
-// Version : 1.0.0
-// Modified: 2026-04-01 15:00 UTC
+// Version : 1.2.0
+// Modified: 2026-04-01 18:00 UTC
 //
 // Changes:
+//   v1.2.0 - 2026-04-01 - Removed postponed counter; track rdap_skipped instead
+//   v1.1.0 - 2026-04-01 - Track and display postponed domain count
 //   v1.0.0 - 2026-04-01 - Initial implementation
 //
 // Summary: Progress and diagnostic reporter for validation runs.
@@ -13,6 +15,10 @@
 //
 //            verbose — additionally prints one line per domain showing its
 //                      score, status, which sources fired, and any errors.
+//
+//          Domains where RDAP was throttled are counted in rdapSkipped but
+//          still land in the normal status buckets — they score and persist
+//          like any other domain, just without the RDAP contribution.
 //
 //          All output goes to stderr so stdout stays clean for piping.
 //          Safe for concurrent use (sync.Mutex on counters).
@@ -37,12 +43,13 @@ type Progress struct {
 	start    time.Time
 
 	// atomic counters — safe to increment from any goroutine
-	done     atomic.Int64
-	active   atomic.Int64
-	inactive atomic.Int64
-	stale    atomic.Int64
-	unknown  atomic.Int64
-	errors   atomic.Int64
+	done        atomic.Int64
+	active      atomic.Int64
+	inactive    atomic.Int64
+	stale       atomic.Int64
+	unknown     atomic.Int64
+	errors      atomic.Int64
+	rdapSkipped atomic.Int64 // domains where RDAP was skipped due to throttle backoff
 
 	mu sync.Mutex // protects the ticker logic only
 }
@@ -69,8 +76,15 @@ func (p *Progress) Start() {
 // Domain is called once per validated domain with its full result.
 // Always updates counters; prints a per-domain line only in verbose mode.
 func (p *Progress) Domain(r *ValidationResult) {
-	// Update counters.
 	p.done.Add(1)
+	n := p.done.Load()
+
+	if r.RDAPSkipped {
+		p.rdapSkipped.Add(1)
+	}
+
+	// All domains — including those with RDAP skipped — land in the normal
+	// status buckets. The throttle only affects the score, not the reporting path.
 	switch r.Status {
 	case StatusActive:
 		p.active.Add(1)
@@ -85,20 +99,12 @@ func (p *Progress) Domain(r *ValidationResult) {
 		p.errors.Add(1)
 	}
 
-	n := p.done.Load()
-
 	if p.verbose {
 		p.printDomain(r, n)
 	}
 
-	// Normal-mode ticker: print a summary line every progressTickEvery domains.
 	if !p.verbose {
-		p.mu.Lock()
-		tick := n%progressTickEvery == 0 || int(n) == p.total
-		p.mu.Unlock()
-		if tick {
-			p.printSummaryLine(n)
-		}
+		p.maybeTick(n)
 	}
 }
 
@@ -109,25 +115,37 @@ func (p *Progress) Finish() {
 	rate := float64(n) / elapsed.Seconds()
 
 	p.printf("  └─ done: %d domain(s) in %s (%.1f/s)\n", n, fmtDuration(elapsed), rate)
-	p.printf("     active=%-6d inactive=%-6d stale=%-6d unknown=%-6d errors=%d\n",
+	p.printf("     active=%-6d inactive=%-6d stale=%-6d unknown=%-6d errors=%d",
 		p.active.Load(), p.inactive.Load(), p.stale.Load(), p.unknown.Load(), p.errors.Load())
+
+	// Only print the rdap_skipped column when relevant — keeps clean runs clean.
+	if sk := p.rdapSkipped.Load(); sk > 0 {
+		p.printf("  rdap_skipped=%d (scored without RDAP — will fill in next cycle)", sk)
+	}
+	p.printf("\n")
 }
 
 // --- internal helpers ---
 
+// maybeTick prints a summary line in normal mode every progressTickEvery domains.
+func (p *Progress) maybeTick(n int64) {
+	p.mu.Lock()
+	tick := n%progressTickEvery == 0 || int(n) == p.total
+	p.mu.Unlock()
+	if tick {
+		p.printSummaryLine(n)
+	}
+}
+
 // printDomain prints one line per domain (verbose mode).
 // Format:  [  42/1000]  ACTIVE  210  google.com  (TOP_N,RDAP,DNS_DELEGATION,DNS_RESOLUTION)
 func (p *Progress) printDomain(r *ValidationResult, n int64) {
-	// Format the index column width based on total.
 	idx := fmt.Sprintf("[%*d/%d]", len(fmt.Sprint(p.total)), n, p.total)
 	if p.total == 0 {
 		idx = fmt.Sprintf("[%d]", n)
 	}
-
-	// Pad status to fixed width for alignment.
 	status := fmt.Sprintf("%-8s", r.Status)
 
-	// Build source list string.
 	sources := "-"
 	if len(r.Sources) > 0 {
 		ss := make([]string, len(r.Sources))
@@ -143,7 +161,6 @@ func (p *Progress) printDomain(r *ValidationResult, n int64) {
 	if len(r.Errors) > 0 {
 		line += "  !! " + strings.Join(r.Errors, "; ")
 	}
-
 	p.printf("%s\n", line)
 }
 
@@ -163,10 +180,16 @@ func (p *Progress) printSummaryLine(n int64) {
 		}
 	}
 
-	p.printf("  progress: %d/%d%s  active=%-6d inactive=%-6d  %.1f/s%s\n",
+	skipped := p.rdapSkipped.Load()
+	skStr := ""
+	if skipped > 0 {
+		skStr = fmt.Sprintf("  rdap_skipped=%d", skipped)
+	}
+
+	p.printf("  progress: %d/%d%s  active=%-6d inactive=%-6d  %.1f/s%s%s\n",
 		n, p.total, pct,
 		p.active.Load(), p.inactive.Load(),
-		rate, eta)
+		rate, eta, skStr)
 }
 
 // printf writes to stderr (keeps stdout clean for piping).
@@ -177,17 +200,11 @@ func (p *Progress) printf(format string, args ...any) {
 // fmtDuration formats a duration as a compact human string (e.g. "2m04s").
 func fmtDuration(d time.Duration) string {
 	d = d.Round(time.Second)
-	h := d / time.Hour
-	d -= h * time.Hour
-	m := d / time.Minute
-	d -= m * time.Minute
-	s := d / time.Second
-	if h > 0 {
-		return fmt.Sprintf("%dh%02dm%02ds", h, m, s)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
 	}
-	if m > 0 {
-		return fmt.Sprintf("%dm%02ds", m, s)
-	}
-	return fmt.Sprintf("%ds", s)
+	m := int(d.Minutes())
+	s := int(d.Seconds()) % 60
+	return fmt.Sprintf("%dm%02ds", m, s)
 }
 
