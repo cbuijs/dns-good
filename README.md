@@ -207,6 +207,11 @@ Flags:
   -mode    string   Run mode: check | run | stats (default: check)
   -input   string   File with one domain per line (check/run mode)
   -workers int      Override worker count from config (0 = use config)
+  -output  string   Override output directory              (empty = use config)
+  -db      string   Override database file path            (empty = use config)
+  -batch   int      Max domains to validate per run        (0 = unlimited)
+  -reset            Wipe database and output dir before running
+  -verbose          Print per-domain progress (score, status, sources, errors)
 ```
 
 ### Modes
@@ -279,6 +284,24 @@ The database is recreated automatically when the run starts. `-reset` works
 with any `-mode`, including `stats` (though that is rarely useful).
 
 ---
+
+### `-db` — point at a different database file
+
+Overrides `db.path` from `config.yaml` without touching the config file itself.
+Useful for running multiple instances side-by-side, quick ad-hoc inspections,
+or CI pipelines that need an isolated throw-away database.
+
+```bash
+# Use a specific database file instead of the configured one
+./dns-good -db /data/dns-good-prod.db -mode stats
+
+# Two parallel instances, each with their own DB
+./dns-good -db work-a.db -mode run -input list-a.txt &
+./dns-good -db work-b.db -mode run -input list-b.txt &
+
+# -reset honours -db — wipes the right file
+./dns-good -db scratch.db -reset -mode check -input domains.txt
+```
 
 ## Input file format
 

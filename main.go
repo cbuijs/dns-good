@@ -1,8 +1,9 @@
 // File    : main.go
-// Version : 1.2.0
-// Modified: 2026-04-01 17:00 UTC
+// Version : 1.3.0
+// Modified: 2026-04-01 18:00 UTC
 //
 // Changes:
+//   v1.3.0 - 2026-04-01 - Added -db flag to override db.path from config
 //   v1.2.0 - 2026-04-01 - Added -reset flag to wipe DB and output dir before a run
 //   v1.1.0 - 2026-04-01 - Added -output and -verbose flags; verbose threaded through
 //   v1.0.0 - 2026-04-01 - Initial implementation
@@ -39,6 +40,7 @@ func main() {
 	workers    := flag.Int(   "workers",  0,            "Override validation worker count (0 = use config)")
 	verbose    := flag.Bool(  "verbose", false,         "Print one progress line per domain (score, status, sources, errors)")
 	outputDir  := flag.String("output",  "",            "Override output directory for status text files (empty = use config)")
+	dbPath     := flag.String("db",      "",            "Override database file path from config (empty = use config)")
 	reset      := flag.Bool(  "reset",   false,         "Wipe the database and output directory before running (fresh start)")
 	batch      := flag.Int(   "batch",    0,            "Max domains to validate per run (0 = unlimited)")
 	flag.Usage = func() {
@@ -68,15 +70,25 @@ Modes:
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+
+	// CLI overrides — applied after config load so flags always win.
 	if *workers > 0 {
 		cfg.Validation.Workers = *workers
 	}
 	if *outputDir != "" {
 		cfg.Output.Dir = *outputDir
 	}
+	// -db overrides db.path from the YAML config. Handy when running
+	// multiple instances side-by-side or pointing at a shared/network DB
+	// without having to maintain separate config files.
+	if *dbPath != "" {
+		cfg.DB.Path = *dbPath
+	}
 
 	// Reset wipes the database file and output directory before anything else
 	// runs. The store is opened fresh afterwards so the schema is re-applied.
+	// Note: uses cfg.DB.Path, which has already been overridden above if -db
+	// was supplied — so -reset + -db correctly wipes the right file.
 	if *reset {
 		doReset(cfg)
 	}
