@@ -1,22 +1,38 @@
 # File    : config.yaml
-# Version : 1.0.0
-# Modified: 2026-04-01 12:00 UTC
+# Version : 1.2.0
+# Modified: 2026-04-01 16:00 UTC
 #
 # Changes:
+#   v1.2.0 - 2026-04-01 - Added min_active_score
+#   v1.1.0 - 2026-04-01 - Added output section
 #   v1.0.0 - 2026-04-01 - Initial implementation
 #
-# Summary: Runtime configuration for dns-good. All values shown
-#          are the built-in defaults. Comment out or remove any
-#          field to fall back to the default. Missing file = all defaults.
+# Summary: Runtime configuration for dns-good. All values shown are the
+#          built-in defaults. Comment out or remove any field to fall back
+#          to the default. A missing file means all defaults apply.
 
 db:
   path: dns-good.db             # SQLite file; created automatically if absent
 
 validation:
-  workers: 20                   # Goroutines running domain checks in parallel
-  stale_ttl: 24h                # After this, an ACTIVE/INACTIVE entry becomes STALE
-  revalidate_delay: 4h          # Pause between "run" mode ticks
-  timeout: 15s                  # Hard per-domain deadline across all checks combined
+  workers: 20                   # Parallel validation goroutines
+  stale_ttl: 24h                # Entries older than this become STALE
+  revalidate_delay: 4h          # Sleep between cycles in run mode
+  timeout: 15s                  # Hard per-domain deadline
+  min_active_score: 100         # Minimum trust score to qualify as ACTIVE (0-250).
+                                # A domain must also have live DNS evidence (NS or
+                                # A/AAAA) — score alone is never sufficient.
+                                #
+                                # Common thresholds:
+                                #    50 — NS records alone is enough
+                                #   100 — DNS resolution alone, or delegation + 1 source (default)
+                                #   150 — delegation + 2 sources required
+                                #   200 — resolution + delegation + 1 source required
+                                #   250 — all four sources must confirm
+
+output:
+  dir: output                   # Directory for status text files (active/inactive/stale/unknown.txt)
+                                # Created automatically if absent. Set to "" to disable export.
 
 dns:
   # All 13 IANA root server IPv4 addresses. One is picked at random per
@@ -48,14 +64,10 @@ rdap:
   min_gap_ms: 500                   # Min milliseconds between requests to the same RDAP host
                                     # (500ms ≈ 2 req/s max per registry — polite default)
 
-output:
-  dir: output           # Directory for status text files (active/inactive/stale/unknown.txt)
-                        # Created automatically if absent. Set to "" to disable export.
-
 topn:
   provider: tranco               # "tranco" is the only supported provider right now
   url: "https://tranco-list.eu/top-1m.csv.zip"
   cache_path: tranco.csv         # Unzipped CSV is written here after first download
   refresh_ttl: 24h               # Re-download the list after this period
-  size: 1000000                  # Load the top N entries (set lower to reduce memory use)
+  size: 1000000                  # Load top-N entries (set lower to reduce memory use)
 

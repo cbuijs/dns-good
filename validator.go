@@ -1,8 +1,10 @@
 // File    : validator.go
-// Version : 1.0.0
-// Modified: 2026-04-01 12:00 UTC
+// Version : 1.2.0
+// Modified: 2026-04-01 16:00 UTC
 //
 // Changes:
+//   v1.2.0 - 2026-04-01 - Pass MinActiveScore through to Score()
+//   v1.1.0 - 2026-04-01 - resolver/rdap/topn lifted to main; verbose flag added
 //   v1.0.0 - 2026-04-01 - Initial implementation
 //
 // Summary: Orchestrates per-domain validation across all four sources
@@ -31,14 +33,17 @@ type Validator struct {
 	verbose  bool
 }
 
-// NewValidator constructs a Validator from the given config and store.
-func NewValidator(cfg *Config, store *Store, verbose bool) *Validator {
+// NewValidator constructs a Validator from the given config, store, and
+// pre-initialised long-lived components. resolver, rdap, and topn are
+// created once in main and reused across runs so their in-memory state
+// (parsed TOP-N map, RDAP bootstrap, DNS client) survives between cycles.
+func NewValidator(cfg *Config, store *Store, resolver *Resolver, rdap *RDAPClient, topn *TopN, verbose bool) *Validator {
 	return &Validator{
 		cfg:      cfg,
 		store:    store,
-		resolver: NewResolver(cfg.DNS.MaxDepth, cfg.DNS.Retries, cfg.DNS.Timeout),
-		rdap:     NewRDAPClient(cfg),
-		topn:     NewTopN(cfg),
+		resolver: resolver,
+		rdap:     rdap,
+		topn:     topn,
 		verbose:  verbose,
 	}
 }
@@ -46,7 +51,7 @@ func NewValidator(cfg *Config, store *Store, verbose bool) *Validator {
 // RunBatch fetches all UNKNOWN/STALE domains from the store and validates
 // them concurrently. Returns the number of domains processed.
 func (v *Validator) RunBatch() int {
-	entries, err := v.store.GetNeedingValidation(10_000)
+	entries, err := v.store.GetNeedingValidation()
 	if err != nil {
 		log.Printf("validator: fetch work: %v", err)
 		return 0
@@ -161,7 +166,7 @@ func (v *Validator) validateOne(domain string) *ValidationResult {
 	}
 
 	// Score everything and set final status.
-	Score(result)
+	Score(result, v.cfg.Validation.MinActiveScore)
 	return result
 }
 

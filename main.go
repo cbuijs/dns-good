@@ -1,8 +1,10 @@
 // File    : main.go
-// Version : 1.0.0
-// Modified: 2026-04-01 12:00 UTC
+// Version : 1.2.0
+// Modified: 2026-04-01 17:00 UTC
 //
 // Changes:
+//   v1.2.0 - 2026-04-01 - Added -reset flag to wipe DB and output dir before a run
+//   v1.1.0 - 2026-04-01 - Added -output and -verbose flags; verbose threaded through
 //   v1.0.0 - 2026-04-01 - Initial implementation
 //
 // Summary: Entry point for dns-good. Parses CLI flags, wires up all
@@ -37,6 +39,7 @@ func main() {
 	workers    := flag.Int(   "workers",  0,            "Override validation worker count (0 = use config)")
 	verbose    := flag.Bool(  "verbose", false,         "Print one progress line per domain (score, status, sources, errors)")
 	outputDir  := flag.String("output",  "",            "Override output directory for status text files (empty = use config)")
+	reset      := flag.Bool(  "reset",   false,         "Wipe the database and output directory before running (fresh start)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `dns-good — DNS domain validation repository
 
@@ -71,12 +74,25 @@ Modes:
 		cfg.Output.Dir = *outputDir
 	}
 
+	// Reset wipes the database file and output directory before anything else
+	// runs. The store is opened fresh afterwards so the schema is re-applied.
+	if *reset {
+		doReset(cfg)
+	}
+
 	// --- Storage ---
 	store, err := NewStore(cfg.DB.Path)
 	if err != nil {
 		log.Fatalf("store: %v", err)
 	}
 	defer store.Close()
+
+	// Long-lived components — created once and reused across every run cycle.
+	// This keeps the Tranco TOP-N map, RDAP bootstrap, and DNS client state
+	// in memory between runs instead of re-parsing from disk each time.
+	resolver := NewResolver(cfg.DNS.MaxDepth, cfg.DNS.Retries, cfg.DNS.Timeout)
+	rdap     := NewRDAPClient(cfg)
+	topn     := NewTopN(cfg)
 
 	switch *mode {
 
@@ -89,10 +105,11 @@ Modes:
 		// Input file is optional — without one we still revalidate any
 		// STALE/UNKNOWN entries that are already in the store.
 		domains := loadDomains(*inputFile)
-		runCheck(cfg, store, domains, *verbose)
+		runCheck(cfg, store, resolver, rdap, topn, domains, *verbose)
 
 	// ------------------------------------------------------------------
 	case "run":
+		// Graceful shutdown on SIGINT / SIGTERM.
 		stop := make(chan os.Signal, 1)
 		signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
@@ -110,9 +127,10 @@ Modes:
 			}
 
 			if len(domains) > 0 {
-				runCheck(cfg, store, domains, *verbose)
+				runCheck(cfg, store, resolver, rdap, topn, domains, *verbose)
 			} else {
-				runStaleRevalidation(cfg, store, *verbose)
+				// No input file — only revalidate existing stale entries.
+				runStaleRevalidation(cfg, store, resolver, rdap, topn, *verbose)
 			}
 
 			log.Printf("sleeping %s until next cycle", cfg.Validation.RevalidateDelay)
@@ -130,10 +148,11 @@ Modes:
 	}
 }
 
-// runCheck adds the supplied domains to the store (skipping existing ones),
+// runCheck adds the supplied domains to the store (skipping fresh-active ones),
 // then validates every UNKNOWN/STALE entry using the worker pool.
-func runCheck(cfg *Config, store *Store, domains []string, verbose bool) {
+func runCheck(cfg *Config, store *Store, resolver *Resolver, rdap *RDAPClient, topn *TopN, domains []string, verbose bool) {
 	if len(domains) > 0 {
+		// Drop domains that are already ACTIVE and fresh — no work needed for those.
 		filtered, err := store.FilterNewOrStale(domains, cfg.Validation.StaleTTL)
 		if err != nil {
 			log.Printf("filter domains: %v", err)
@@ -154,7 +173,7 @@ func runCheck(cfg *Config, store *Store, domains []string, verbose bool) {
 		}
 	}
 
-	v := NewValidator(cfg, store, verbose)
+	v := NewValidator(cfg, store, resolver, rdap, topn, verbose)
 	results := v.RunBatch()
 	if results == 0 {
 		log.Println("nothing to validate — store is fully up-to-date")
@@ -162,19 +181,43 @@ func runCheck(cfg *Config, store *Store, domains []string, verbose bool) {
 		log.Printf("validated %d domain(s)", results)
 	}
 
-	// Always export, even when nothing was validated this cycle —
-	// the output files should always reflect the current state of the store.
+	// Always export after every cycle so the output files reflect current state.
 	ExportLists(cfg, store)
 }
 
-func runStaleRevalidation(cfg *Config, store *Store, verbose bool) {
-	v := NewValidator(cfg, store, verbose)
+// runStaleRevalidation validates existing STALE/UNKNOWN entries without a new
+// input file. Used in run-mode inner loop when no -input flag was provided.
+func runStaleRevalidation(cfg *Config, store *Store, resolver *Resolver, rdap *RDAPClient, topn *TopN, verbose bool) {
+	v := NewValidator(cfg, store, resolver, rdap, topn, verbose)
 	results := v.RunBatch()
 	if results > 0 {
 		log.Printf("revalidated %d domain(s)", results)
 	}
-	// Same as runCheck — always export regardless of whether work was done.
 	ExportLists(cfg, store)
+}
+
+// doReset removes the SQLite database file (including the WAL and SHM
+// sidecar files SQLite may have created) and clears the output directory.
+// Called before the store is opened so there is no live handle to the DB yet.
+func doReset(cfg *Config) {
+	log.Println("reset: wiping database and output directory")
+
+	// Remove the SQLite database and its WAL/SHM sidecars.
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		path := cfg.DB.Path + suffix
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Fatalf("reset: remove %s: %v", path, err)
+		}
+	}
+	log.Printf("reset: removed database %s", cfg.DB.Path)
+
+	// Remove and recreate the output directory so stale text files are gone.
+	if cfg.Output.Dir != "" {
+		if err := os.RemoveAll(cfg.Output.Dir); err != nil && !os.IsNotExist(err) {
+			log.Fatalf("reset: remove output dir %s: %v", cfg.Output.Dir, err)
+		}
+		log.Printf("reset: cleared output directory %s", cfg.Output.Dir)
+	}
 }
 
 // runStats prints per-status counts from the repository.

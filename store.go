@@ -144,18 +144,17 @@ func (s *Store) AddDomains(domains []string) (added int, err error) {
 	return added, tx.Commit()
 }
 
-// GetNeedingValidation returns up to limit domains with status UNKNOWN or STALE,
+// GetNeedingValidation returns all domains with status UNKNOWN or STALE,
 // ordered oldest-checked-first so the most overdue entries get priority.
 // Call MarkStaleEntries first to transition old ACTIVE/INACTIVE rows to STALE.
-func (s *Store) GetNeedingValidation(limit int) ([]*DomainEntry, error) {
+func (s *Store) GetNeedingValidation() ([]*DomainEntry, error) {
 	rows, err := s.db.Query(`
 		SELECT id, domain, apex, status, score,
 		       first_seen, last_active, last_checked, sources
 		FROM   domains
 		WHERE  status IN ('UNKNOWN', 'STALE')
 		ORDER  BY last_checked ASC NULLS FIRST
-		LIMIT  ?
-	`, limit)
+	`)
 	if err != nil {
 		return nil, err
 	}
@@ -283,15 +282,20 @@ func (s *Store) FilterNewOrStale(domains []string, staleTTL time.Duration) ([]st
 }
 
 // GetAll returns all domain entries, ordered by score desc then domain asc.
-// Supports pagination via limit/offset for large exports.
+// Supports optional pagination via limit/offset; pass limit=0 for all rows.
 func (s *Store) GetAll(limit, offset int) ([]*DomainEntry, error) {
-	rows, err := s.db.Query(`
+	q := `
 		SELECT id, domain, apex, status, score,
 		       first_seen, last_active, last_checked, sources
 		FROM   domains
-		ORDER  BY score DESC, domain ASC
-		LIMIT  ? OFFSET ?
-	`, limit, offset)
+		ORDER  BY score DESC, domain ASC`
+	var rows *sql.Rows
+	var err error
+	if limit > 0 {
+		rows, err = s.db.Query(q+" LIMIT ? OFFSET ?", limit, offset)
+	} else {
+		rows, err = s.db.Query(q)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -300,15 +304,21 @@ func (s *Store) GetAll(limit, offset int) ([]*DomainEntry, error) {
 }
 
 // GetByStatus returns entries filtered to a specific status, ordered by score desc.
+// Pass limit=0 to return all matching rows.
 func (s *Store) GetByStatus(status DomainStatus, limit int) ([]*DomainEntry, error) {
-	rows, err := s.db.Query(`
+	q := `
 		SELECT id, domain, apex, status, score,
 		       first_seen, last_active, last_checked, sources
 		FROM   domains
 		WHERE  status = ?
-		ORDER  BY score DESC, last_checked DESC
-		LIMIT  ?
-	`, string(status), limit)
+		ORDER  BY score DESC, last_checked DESC`
+	var rows *sql.Rows
+	var err error
+	if limit > 0 {
+		rows, err = s.db.Query(q+" LIMIT ?", string(status), limit)
+	} else {
+		rows, err = s.db.Query(q, string(status))
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -1,8 +1,10 @@
 // File    : config.go
-// Version : 1.0.0
-// Modified: 2026-04-01 12:00 UTC
+// Version : 1.2.0
+// Modified: 2026-04-01 16:00 UTC
 //
 // Changes:
+//   v1.2.0 - 2026-04-01 - Added MinActiveScore (default 100)
+//   v1.1.0 - 2026-04-01 - Added Output.Dir
 //   v1.0.0 - 2026-04-01 - Initial implementation
 //
 // Summary: Configuration struct and YAML loader. A missing config
@@ -29,6 +31,7 @@ type Config struct {
 		StaleTTL        time.Duration `yaml:"stale_ttl"`
 		RevalidateDelay time.Duration `yaml:"revalidate_delay"`
 		Timeout         time.Duration `yaml:"timeout"`
+		MinActiveScore  int           `yaml:"min_active_score"` // minimum score required for ACTIVE status
 	} `yaml:"validation"`
 
 	DNS struct {
@@ -70,6 +73,7 @@ func newDefaultConfig() *Config {
 	c.Validation.StaleTTL = 24 * time.Hour
 	c.Validation.RevalidateDelay = 4 * time.Hour
 	c.Validation.Timeout = 15 * time.Second
+	c.Validation.MinActiveScore = 100 // DNS_DELEGATION (50) + any one other source
 
 	// All 13 IANA root servers. We pick one at random per resolution
 	// to spread load naturally across the anycast clusters.

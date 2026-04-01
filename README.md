@@ -33,24 +33,39 @@ operational. A score of 250 means all four checks passed.
 
 Status is **not** simply "score > 0". TOP-N and RDAP are backward-looking
 sources — a domain can still be on a popularity list or show as registered days
-after going dark. Only DNS tells you what is happening *right now*, so **live
-DNS evidence is a hard requirement for `ACTIVE`**:
+after going dark. Two conditions must both be true for a domain to be `ACTIVE`:
+
+1. **Score ≥ `min_active_score`** (configurable, default **100**)
+2. **Live DNS evidence** — NS records or an A/AAAA answer must exist
 
 | Score | NS or A/AAAA found? | Status |
 |---|---|---|
-| > 0 | yes | `ACTIVE` |
-| > 0 | no | `INACTIVE` |
-| 0 | anything | `INACTIVE` |
+| ≥ min_active_score | yes | `ACTIVE` |
+| ≥ min_active_score | no | `INACTIVE` |
+| < min_active_score | anything | `INACTIVE` |
 
-Practical examples:
+Practical examples at the default threshold of 100:
 
 | What the checks found | Score | Status | Why |
 |---|---|---|---|
-| TOP-N only | 50 | `INACTIVE` | Was popular at some point; no DNS presence now |
-| RDAP active only | 50 | `INACTIVE` | Registered but fully dark — no NS, no IPs |
-| NS records only | 50 | `ACTIVE` | Zone is live and delegated |
-| RDAP + NS | 100 | `ACTIVE` | Registered and delegated |
-| TOP-N + RDAP + NS + A/AAAA | 250 | `ACTIVE` | Maximum confidence |
+| TOP-N only | 50 | `INACTIVE` | No DNS evidence |
+| RDAP active only | 50 | `INACTIVE` | No DNS evidence |
+| NS records only | 50 | `INACTIVE` | Below threshold |
+| TOP-N + NS | 100 | `ACTIVE` | Threshold met, DNS confirmed |
+| RDAP + NS | 100 | `ACTIVE` | Threshold met, DNS confirmed |
+| A/AAAA only | 100 | `ACTIVE` | Threshold met by resolution alone |
+| TOP-N + RDAP + NS | 150 | `ACTIVE` | Two sources + delegation |
+| All four | 250 | `ACTIVE` | Maximum confidence |
+
+Configure the threshold to taste:
+
+```yaml
+validation:
+  min_active_score: 100   # default — DNS resolution alone is sufficient
+  # min_active_score: 50  # lenient — NS records alone qualifies
+  # min_active_score: 150 # strict  — delegation + 2 other sources required
+  # min_active_score: 250 # paranoid — all four sources must confirm
+```
 
 ---
 
@@ -243,6 +258,28 @@ Prints a per-status domain count from the repository and exits.
 
 ---
 
+### Starting fresh
+
+Use `-reset` to wipe the database and output directory before a run. This is a
+hard reset — all previous results are gone.
+
+```bash
+# Start from scratch, then immediately check a new list
+./dns-good -reset -mode check -input domains.txt
+
+# Start from scratch in daemon mode
+./dns-good -reset -mode run -input domains.txt
+```
+
+`-reset` removes:
+- The SQLite database file (and its `-wal` / `-shm` sidecars)
+- The entire output directory and all text files inside it
+
+The database is recreated automatically when the run starts. `-reset` works
+with any `-mode`, including `stats` (though that is rarely useful).
+
+---
+
 ## Input file format
 
 One domain per line. Lines starting with `#` and blank lines are ignored.
@@ -309,6 +346,4 @@ topn:
 | `topn.go` | Tranco TOP-N list downloader and in-memory rank lookup |
 | `scorer.go` | Trust score calculation and status assignment |
 | `validator.go` | Worker pool, per-domain orchestration, deadline enforcement |
-
----
 

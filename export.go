@@ -51,8 +51,8 @@ func ExportLists(cfg *Config, store *Store) {
 
 // exportStatus fetches all entries for one status and writes them atomically.
 func exportStatus(cfg *Config, store *Store, status DomainStatus) error {
-	// Fetch all entries for this status (high limit — we want the full list).
-	entries, err := store.GetByStatus(status, 10_000_000)
+	// Fetch all entries for this status.
+	entries, err := store.GetByStatus(status, 0)
 	if err != nil {
 		return fmt.Errorf("query: %w", err)
 	}
