@@ -1,7 +1,5 @@
 # dns-good
 
-!!! UNDER DEVELOPMENT - EXPERIMENTAL !!!
-
 A self-contained DNS domain validation engine with a persistent repository.
 It cross-references multiple data sources to determine whether a domain is
 genuinely active, and keeps that knowledge fresh over time without hammering
@@ -12,18 +10,78 @@ any single external service.
 ## What it does
 
 dns-good maintains a SQLite repository of domain names. Each entry gets a
-**trust score** (0–250) derived from up to four independent sources:
+**trust score** (0–250) built up from up to four independent sources, and a
+**status** that reflects whether the domain is considered live right now.
 
-| Source | Points | What it means |
+---
+
+### Trust score
+
+| Source | Points | What it checks |
 |---|---|---|
-| TOP-N list (Tranco) | 50 | Apex domain appears in a well-known popularity ranking |
-| RDAP / registration | 50 | The registry reports the domain as actively registered |
-| DNS delegation | 50 | NS records exist — the zone is delegated |
-| DNS resolution | 100 | The apex resolves to at least one A or AAAA address |
+| TOP-N list (Tranco) | +50 | Apex domain appears in a well-known popularity ranking |
+| RDAP / registration | +50 | The registry reports the domain as actively registered |
+| DNS delegation | +50 | NS records exist — the zone is delegated to a nameserver |
+| DNS resolution | +100 | The apex resolves to at least one A or AAAA address |
 
-A domain with **any score > 0** is marked `ACTIVE`. Zero evidence → `INACTIVE`.
-Entries age into `STALE` after a configurable TTL and are automatically
-revalidated on the next run.
+The higher the score, the more independent sources agree the domain is real and
+operational. A score of 250 means all four checks passed.
+
+---
+
+### Status
+
+Status is **not** simply "score > 0". TOP-N and RDAP are backward-looking
+sources — a domain can still be on a popularity list or show as registered days
+after going dark. Only DNS tells you what is happening *right now*, so **live
+DNS evidence is a hard requirement for `ACTIVE`**:
+
+| Score | NS or A/AAAA found? | Status |
+|---|---|---|
+| > 0 | yes | `ACTIVE` |
+| > 0 | no | `INACTIVE` |
+| 0 | anything | `INACTIVE` |
+
+Practical examples:
+
+| What the checks found | Score | Status | Why |
+|---|---|---|---|
+| TOP-N only | 50 | `INACTIVE` | Was popular at some point; no DNS presence now |
+| RDAP active only | 50 | `INACTIVE` | Registered but fully dark — no NS, no IPs |
+| NS records only | 50 | `ACTIVE` | Zone is live and delegated |
+| RDAP + NS | 100 | `ACTIVE` | Registered and delegated |
+| TOP-N + RDAP + NS + A/AAAA | 250 | `ACTIVE` | Maximum confidence |
+
+---
+
+### Lifecycle
+
+Entries move through four states:
+
+```
+UNKNOWN ──(first check)──► ACTIVE or INACTIVE
+                                │
+                          (stale_ttl elapsed)
+                                │
+                             STALE
+                                │
+                          (next run picks up)
+                                │
+                        ACTIVE or INACTIVE
+```
+
+| Status | Meaning |
+|---|---|
+| `UNKNOWN` | Queued from input, never checked yet |
+| `ACTIVE` | Score > 0 and live DNS evidence on last check |
+| `INACTIVE` | No DNS evidence (or zero score) on last check |
+| `STALE` | Last check is older than `stale_ttl` — awaiting revalidation |
+
+`STALE` is a **time-driven transition**, not a check result. dns-good marks
+`ACTIVE` and `INACTIVE` entries stale automatically so they get rechecked
+periodically without any manual intervention.
+
+---
 
 ### Why iterative DNS?
 
@@ -47,12 +105,67 @@ chains for negligible accuracy gain.
 |---|---|
 | `domain` | Full domain name as submitted |
 | `apex` | Registered apex (e.g. `example.com` for `sub.example.com`) |
-| `status` | `ACTIVE` / `INACTIVE` / `STALE` / `UNKNOWN` |
-| `score` | Trust score 0–250 |
+| `status` | `ACTIVE` / `INACTIVE` / `STALE` / `UNKNOWN` — see above |
+| `score` | Trust score 0–250 — how many sources confirmed activity |
 | `first_seen` | Timestamp of the very first successful validation |
-| `last_active` | Most recent timestamp where score was > 0 |
-| `last_checked` | Timestamp of the last validation attempt |
+| `last_active` | Most recent timestamp where status was `ACTIVE` |
+| `last_checked` | Timestamp of the last validation attempt (any outcome) |
 | `sources` | Which sources confirmed activity on the last check |
+
+## Output files
+
+After every `check` or `run` cycle dns-good writes one plain-text file per
+status into the configured output directory. The files are always a complete
+snapshot of the repository at that moment — not a diff or delta.
+
+```
+output/
+  active.txt
+  inactive.txt
+  stale.txt
+  unknown.txt
+```
+
+Each file has a small self-describing header followed by one domain per line,
+sorted alphabetically:
+
+```
+# dns-good — ACTIVE domains
+# Generated : 2026-04-01T14:32:07Z
+# Count     : 48231
+# Score note: score > 0 — at least one source confirmed activity
+#
+example.com
+github.com
+google.com
+...
+```
+
+A few details worth knowing:
+
+- **Always written** — export runs at the end of every cycle regardless of
+  whether any validation work was done. The files always reflect current store
+  state, not just what changed this run.
+- **Atomic writes** — each file is written to a `.tmp` sibling first, then
+  renamed into place. Readers never see a partial file mid-update.
+- **Disabled by default when `dir` is empty** — set `output.dir: ""` in
+  `config.yaml` to turn off file export entirely (the SQLite store is still
+  updated as normal).
+
+Configure the output directory in `config.yaml`:
+
+```yaml
+output:
+  dir: output    # relative or absolute path; created automatically if absent
+                 # set to "" to disable
+```
+
+Or point it elsewhere at runtime — the directory is created if it doesn't exist:
+
+```yaml
+output:
+  dir: /var/lib/dns-good/lists
+```
 
 ---
 

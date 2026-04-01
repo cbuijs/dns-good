@@ -36,6 +36,7 @@ func main() {
 	inputFile  := flag.String("input",   "",            "File with one domain per line (check/run mode)")
 	workers    := flag.Int(   "workers",  0,            "Override validation worker count (0 = use config)")
 	verbose    := flag.Bool(  "verbose", false,         "Print one progress line per domain (score, status, sources, errors)")
+	outputDir  := flag.String("output",  "",            "Override output directory for status text files (empty = use config)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `dns-good — DNS domain validation repository
 
@@ -65,6 +66,9 @@ Modes:
 	}
 	if *workers > 0 {
 		cfg.Validation.Workers = *workers
+	}
+	if *outputDir != "" {
+		cfg.Output.Dir = *outputDir
 	}
 
 	// --- Storage ---

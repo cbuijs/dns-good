@@ -26,29 +26,32 @@ package main
 // for convenient chaining.
 func Score(r *ValidationResult) *ValidationResult {
 	r.Score = 0
-	r.Sources = r.Sources[:0] // reset without reallocating
+	r.Sources = r.Sources[:0]
 
 	if r.InTopN {
 		r.Score += ScoreTopN
 		r.Sources = append(r.Sources, SourceTopN)
 	}
-
 	if r.RDAPActive {
 		r.Score += ScoreRDAP
 		r.Sources = append(r.Sources, SourceRDAP)
 	}
-
 	if r.HasNS {
 		r.Score += ScoreDNSDelegation
 		r.Sources = append(r.Sources, SourceDNSDelegation)
 	}
-
 	if r.HasA || r.HasAAAA {
 		r.Score += ScoreDNSResolution
 		r.Sources = append(r.Sources, SourceDNSResolution)
 	}
 
-	if r.Score > 0 {
+	// A domain is only ACTIVE when it has live DNS evidence (NS records or
+	// an actual A/AAAA answer). TOP_N and RDAP alone indicate the domain was
+	// registered and popular at some point, but cannot confirm it is
+	// operational right now. Without DNS evidence the domain is INACTIVE
+	// regardless of its score.
+	hasDNSEvidence := r.HasNS || r.HasA || r.HasAAAA
+	if r.Score > 0 && hasDNSEvidence {
 		r.Status = StatusActive
 	} else {
 		r.Status = StatusInactive
