@@ -82,11 +82,9 @@ Modes:
 
 	// ------------------------------------------------------------------
 	case "check":
+		// Input file is optional — without one we still revalidate any
+		// STALE/UNKNOWN entries that are already in the store.
 		domains := loadDomains(*inputFile)
-		if len(domains) == 0 {
-			log.Println("no domains to check")
-			return
-		}
 		runCheck(cfg, store, domains, *verbose)
 
 	// ------------------------------------------------------------------
@@ -131,17 +129,37 @@ Modes:
 // runCheck adds the supplied domains to the store (skipping existing ones),
 // then validates every UNKNOWN/STALE entry using the worker pool.
 func runCheck(cfg *Config, store *Store, domains []string, verbose bool) {
-	added, err := store.AddDomains(domains)
-	if err != nil {
-		log.Printf("add domains: %v", err)
-	}
-	if added > 0 {
-		log.Printf("added %d new domain(s) to repository", added)
+	if len(domains) > 0 {
+		filtered, err := store.FilterNewOrStale(domains, cfg.Validation.StaleTTL)
+		if err != nil {
+			log.Printf("filter domains: %v", err)
+			filtered = domains
+		}
+		skipped := len(domains) - len(filtered)
+		if skipped > 0 {
+			log.Printf("skipped %d domain(s) already active and fresh in repository", skipped)
+		}
+		if len(filtered) > 0 {
+			added, err := store.AddDomains(filtered)
+			if err != nil {
+				log.Printf("add domains: %v", err)
+			}
+			if added > 0 {
+				log.Printf("added %d new domain(s) to repository", added)
+			}
+		}
 	}
 
 	v := NewValidator(cfg, store, verbose)
 	results := v.RunBatch()
-	log.Printf("validated %d domain(s)", results)
+	if results == 0 {
+		log.Println("nothing to validate — store is fully up-to-date")
+	} else {
+		log.Printf("validated %d domain(s)", results)
+	}
+
+	// Always export, even when nothing was validated this cycle —
+	// the output files should always reflect the current state of the store.
 	ExportLists(cfg, store)
 }
 
@@ -151,6 +169,7 @@ func runStaleRevalidation(cfg *Config, store *Store, verbose bool) {
 	if results > 0 {
 		log.Printf("revalidated %d domain(s)", results)
 	}
+	// Same as runCheck — always export regardless of whether work was done.
 	ExportLists(cfg, store)
 }
 

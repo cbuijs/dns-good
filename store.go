@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite" // registers the "sqlite" driver
+	_ "modernc.org/sqlite"
 )
 
 // schema is applied on every startup (all statements are IF NOT EXISTS).
@@ -197,6 +197,89 @@ func (s *Store) Stats() (map[string]int64, error) {
 		out[st] = n
 	}
 	return out, rows.Err()
+}
+
+// FilterNewOrStale takes a list of domain names from an input file and returns
+// only those that actually need work:
+//   - not in the DB yet (new)
+//   - in the DB but status is not ACTIVE
+//   - in the DB, status is ACTIVE, but last_checked is older than staleTTL
+//     (i.e. the entry would be considered stale on this run anyway)
+//
+// Domains that are ACTIVE and fresh are silently dropped — no point queuing
+// them again. Uses a single IN-clause query per batch of 500 to avoid hitting
+// SQLite's variable limit.
+func (s *Store) FilterNewOrStale(domains []string, staleTTL time.Duration) ([]string, error) {
+	if len(domains) == 0 {
+		return nil, nil
+	}
+
+	cutoff := time.Now().Add(-staleTTL)
+
+	// Normalise input and build a lookup set so we can subtract known-fresh ones.
+	normalised := make([]string, 0, len(domains))
+	seen := make(map[string]bool, len(domains))
+	for _, d := range domains {
+		d = strings.ToLower(strings.TrimSpace(d))
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		normalised = append(normalised, d)
+	}
+
+	// Query the DB in chunks of 500 (SQLite SQLITE_MAX_VARIABLE_NUMBER = 999).
+	const chunkSize = 500
+	freshActive := make(map[string]bool) // domains we can safely skip
+
+	for i := 0; i < len(normalised); i += chunkSize {
+		end := i + chunkSize
+		if end > len(normalised) {
+			end = len(normalised)
+		}
+		chunk := normalised[i:end]
+
+		placeholders := strings.Repeat("?,", len(chunk))
+		placeholders = placeholders[:len(placeholders)-1]
+
+		args := make([]any, 0, len(chunk)+1)
+		for _, d := range chunk {
+			args = append(args, d)
+		}
+		args = append(args, cutoff)
+
+		// Select domains that are ACTIVE *and* still within the freshness window.
+		rows, err := s.db.Query(fmt.Sprintf(`
+			SELECT domain FROM domains
+			WHERE  domain IN (%s)
+			  AND  status = 'ACTIVE'
+			  AND  last_checked >= ?
+		`, placeholders), args...)
+		if err != nil {
+			return nil, fmt.Errorf("filter query: %w", err)
+		}
+		for rows.Next() {
+			var d string
+			if err := rows.Scan(&d); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			freshActive[d] = true
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	// Return everything that is NOT a fresh-active entry.
+	out := make([]string, 0, len(normalised))
+	for _, d := range normalised {
+		if !freshActive[d] {
+			out = append(out, d)
+		}
+	}
+	return out, nil
 }
 
 // GetAll returns all domain entries, ordered by score desc then domain asc.
