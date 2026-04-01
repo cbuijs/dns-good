@@ -48,10 +48,11 @@ func NewValidator(cfg *Config, store *Store, resolver *Resolver, rdap *RDAPClien
 	}
 }
 
-// RunBatch fetches all UNKNOWN/STALE domains from the store and validates
-// them concurrently. Returns the number of domains processed.
-func (v *Validator) RunBatch() int {
-	entries, err := v.store.GetNeedingValidation()
+// RunBatch fetches UNKNOWN/STALE domains from the store and validates them
+// concurrently. batch limits how many are processed in one call; 0 = unlimited.
+// Returns the number of domains processed.
+func (v *Validator) RunBatch(batch int) int {
+	entries, err := v.store.GetNeedingValidation(batch)
 	if err != nil {
 		log.Printf("validator: fetch work: %v", err)
 		return 0

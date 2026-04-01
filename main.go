@@ -40,6 +40,7 @@ func main() {
 	verbose    := flag.Bool(  "verbose", false,         "Print one progress line per domain (score, status, sources, errors)")
 	outputDir  := flag.String("output",  "",            "Override output directory for status text files (empty = use config)")
 	reset      := flag.Bool(  "reset",   false,         "Wipe the database and output directory before running (fresh start)")
+	batch      := flag.Int(   "batch",    0,            "Max domains to validate per run (0 = unlimited)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `dns-good — DNS domain validation repository
 
@@ -105,7 +106,7 @@ Modes:
 		// Input file is optional — without one we still revalidate any
 		// STALE/UNKNOWN entries that are already in the store.
 		domains := loadDomains(*inputFile)
-		runCheck(cfg, store, resolver, rdap, topn, domains, *verbose)
+		runCheck(cfg, store, resolver, rdap, topn, domains, *verbose, *batch)
 
 	// ------------------------------------------------------------------
 	case "run":
@@ -127,10 +128,9 @@ Modes:
 			}
 
 			if len(domains) > 0 {
-				runCheck(cfg, store, resolver, rdap, topn, domains, *verbose)
+				runCheck(cfg, store, resolver, rdap, topn, domains, *verbose, *batch)
 			} else {
-				// No input file — only revalidate existing stale entries.
-				runStaleRevalidation(cfg, store, resolver, rdap, topn, *verbose)
+				runStaleRevalidation(cfg, store, resolver, rdap, topn, *verbose, *batch)
 			}
 
 			log.Printf("sleeping %s until next cycle", cfg.Validation.RevalidateDelay)
@@ -150,9 +150,8 @@ Modes:
 
 // runCheck adds the supplied domains to the store (skipping fresh-active ones),
 // then validates every UNKNOWN/STALE entry using the worker pool.
-func runCheck(cfg *Config, store *Store, resolver *Resolver, rdap *RDAPClient, topn *TopN, domains []string, verbose bool) {
+func runCheck(cfg *Config, store *Store, resolver *Resolver, rdap *RDAPClient, topn *TopN, domains []string, verbose bool, batch int) {
 	if len(domains) > 0 {
-		// Drop domains that are already ACTIVE and fresh — no work needed for those.
 		filtered, err := store.FilterNewOrStale(domains, cfg.Validation.StaleTTL)
 		if err != nil {
 			log.Printf("filter domains: %v", err)
@@ -174,22 +173,18 @@ func runCheck(cfg *Config, store *Store, resolver *Resolver, rdap *RDAPClient, t
 	}
 
 	v := NewValidator(cfg, store, resolver, rdap, topn, verbose)
-	results := v.RunBatch()
+	results := v.RunBatch(batch)
 	if results == 0 {
 		log.Println("nothing to validate — store is fully up-to-date")
 	} else {
 		log.Printf("validated %d domain(s)", results)
 	}
-
-	// Always export after every cycle so the output files reflect current state.
 	ExportLists(cfg, store)
 }
 
-// runStaleRevalidation validates existing STALE/UNKNOWN entries without a new
-// input file. Used in run-mode inner loop when no -input flag was provided.
-func runStaleRevalidation(cfg *Config, store *Store, resolver *Resolver, rdap *RDAPClient, topn *TopN, verbose bool) {
+func runStaleRevalidation(cfg *Config, store *Store, resolver *Resolver, rdap *RDAPClient, topn *TopN, verbose bool, batch int) {
 	v := NewValidator(cfg, store, resolver, rdap, topn, verbose)
-	results := v.RunBatch()
+	results := v.RunBatch(batch)
 	if results > 0 {
 		log.Printf("revalidated %d domain(s)", results)
 	}

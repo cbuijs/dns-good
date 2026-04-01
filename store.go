@@ -144,17 +144,24 @@ func (s *Store) AddDomains(domains []string) (added int, err error) {
 	return added, tx.Commit()
 }
 
-// GetNeedingValidation returns all domains with status UNKNOWN or STALE,
+// GetNeedingValidation returns domains with status UNKNOWN or STALE,
 // ordered oldest-checked-first so the most overdue entries get priority.
+// limit caps the number of rows returned; 0 means unlimited.
 // Call MarkStaleEntries first to transition old ACTIVE/INACTIVE rows to STALE.
-func (s *Store) GetNeedingValidation() ([]*DomainEntry, error) {
-	rows, err := s.db.Query(`
+func (s *Store) GetNeedingValidation(limit int) ([]*DomainEntry, error) {
+	q := `
 		SELECT id, domain, apex, status, score,
 		       first_seen, last_active, last_checked, sources
 		FROM   domains
 		WHERE  status IN ('UNKNOWN', 'STALE')
-		ORDER  BY last_checked ASC NULLS FIRST
-	`)
+		ORDER  BY last_checked ASC NULLS FIRST`
+	var rows *sql.Rows
+	var err error
+	if limit > 0 {
+		rows, err = s.db.Query(q+" LIMIT ?", limit)
+	} else {
+		rows, err = s.db.Query(q)
+	}
 	if err != nil {
 		return nil, err
 	}
