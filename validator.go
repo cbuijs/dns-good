@@ -28,34 +28,36 @@ type Validator struct {
 	resolver *Resolver
 	rdap     *RDAPClient
 	topn     *TopN
+	verbose  bool
 }
 
 // NewValidator constructs a Validator from the given config and store.
-func NewValidator(cfg *Config, store *Store) *Validator {
+func NewValidator(cfg *Config, store *Store, verbose bool) *Validator {
 	return &Validator{
 		cfg:      cfg,
 		store:    store,
 		resolver: NewResolver(cfg.DNS.MaxDepth, cfg.DNS.Retries, cfg.DNS.Timeout),
 		rdap:     NewRDAPClient(cfg),
 		topn:     NewTopN(cfg),
+		verbose:  verbose,
 	}
 }
 
 // RunBatch fetches all UNKNOWN/STALE domains from the store and validates
 // them concurrently. Returns the number of domains processed.
 func (v *Validator) RunBatch() int {
-	// Fetch a large page of work; RunBatch can be called in a loop if needed.
 	entries, err := v.store.GetNeedingValidation(10_000)
 	if err != nil {
 		log.Printf("validator: fetch work: %v", err)
 		return 0
 	}
 	if len(entries) == 0 {
+		log.Println("validator: nothing to validate")
 		return 0
 	}
 
-	log.Printf("validator: processing %d domain(s) with %d worker(s)",
-		len(entries), v.cfg.Validation.Workers)
+	prog := NewProgress(v.verbose, len(entries))
+	prog.Start()
 
 	sem := make(chan struct{}, v.cfg.Validation.Workers)
 	var wg sync.WaitGroup
@@ -63,12 +65,13 @@ func (v *Validator) RunBatch() int {
 
 	for _, e := range entries {
 		wg.Add(1)
-		sem <- struct{}{} // acquire
+		sem <- struct{}{}
 		go func(domain string) {
 			defer wg.Done()
-			defer func() { <-sem }() // release
+			defer func() { <-sem }()
 
 			result := v.validateOne(domain)
+			prog.Domain(result)
 			if err := v.store.Upsert(result); err != nil {
 				log.Printf("validator: upsert %s: %v", domain, err)
 			}
@@ -77,6 +80,7 @@ func (v *Validator) RunBatch() int {
 	}
 
 	wg.Wait()
+	prog.Finish()
 	return int(processed.Load())
 }
 

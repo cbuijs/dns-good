@@ -46,6 +46,10 @@ type Config struct {
 		MinGapMs     int           `yaml:"min_gap_ms"` // ms between requests to the same RDAP host
 	} `yaml:"rdap"`
 
+	Output struct {
+		Dir string `yaml:"dir"` // write status text files here; empty = disabled
+	} `yaml:"output"`
+
 	TopN struct {
 		Provider   string        `yaml:"provider"`
 		URL        string        `yaml:"url"`
@@ -93,6 +97,8 @@ func newDefaultConfig() *Config {
 	c.RDAP.CacheTTL = 48 * time.Hour
 	c.RDAP.Timeout = 10 * time.Second
 	c.RDAP.MinGapMs = 500 // ~2 req/s per RDAP host
+
+	c.Output.Dir = "output" // write active/inactive/stale/unknown.txt here
 
 	c.TopN.Provider = "tranco"
 	c.TopN.URL = "https://tranco-list.eu/top-1m.csv.zip"

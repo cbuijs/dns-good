@@ -48,6 +48,10 @@ rdap:
   min_gap_ms: 500                   # Min milliseconds between requests to the same RDAP host
                                     # (500ms ≈ 2 req/s max per registry — polite default)
 
+output:
+  dir: output           # Directory for status text files (active/inactive/stale/unknown.txt)
+                        # Created automatically if absent. Set to "" to disable export.
+
 topn:
   provider: tranco               # "tranco" is the only supported provider right now
   url: "https://tranco-list.eu/top-1m.csv.zip"

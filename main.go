@@ -31,10 +31,11 @@ import (
 
 func main() {
 	// --- CLI flags ---
-	configPath := flag.String("config", "config.yaml", "Path to YAML config file")
-	mode       := flag.String("mode",   "check",       "Run mode: check | run | stats")
-	inputFile  := flag.String("input",  "",            "File with one domain per line (check/run mode)")
-	workers    := flag.Int(   "workers", 0,            "Override validation worker count (0 = use config)")
+	configPath := flag.String("config",  "config.yaml", "Path to YAML config file")
+	mode       := flag.String("mode",    "check",       "Run mode: check | run | stats")
+	inputFile  := flag.String("input",   "",            "File with one domain per line (check/run mode)")
+	workers    := flag.Int(   "workers",  0,            "Override validation worker count (0 = use config)")
+	verbose    := flag.Bool(  "verbose", false,         "Print one progress line per domain (score, status, sources, errors)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `dns-good — DNS domain validation repository
 
@@ -86,11 +87,10 @@ Modes:
 			log.Println("no domains to check")
 			return
 		}
-		runCheck(cfg, store, domains)
+		runCheck(cfg, store, domains, *verbose)
 
 	// ------------------------------------------------------------------
 	case "run":
-		// Graceful shutdown on SIGINT / SIGTERM.
 		stop := make(chan os.Signal, 1)
 		signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
@@ -100,7 +100,6 @@ Modes:
 			cfg.Validation.Workers, cfg.Validation.StaleTTL, cfg.Validation.RevalidateDelay)
 
 		for {
-			// Mark old entries as stale so they get picked up this round.
 			n, err := store.MarkStaleEntries(cfg.Validation.StaleTTL)
 			if err != nil {
 				log.Printf("mark stale: %v", err)
@@ -109,10 +108,9 @@ Modes:
 			}
 
 			if len(domains) > 0 {
-				runCheck(cfg, store, domains)
+				runCheck(cfg, store, domains, *verbose)
 			} else {
-				// No new input file — only revalidate existing stale entries.
-				runStaleRevalidation(cfg, store)
+				runStaleRevalidation(cfg, store, *verbose)
 			}
 
 			log.Printf("sleeping %s until next cycle", cfg.Validation.RevalidateDelay)
@@ -132,7 +130,7 @@ Modes:
 
 // runCheck adds the supplied domains to the store (skipping existing ones),
 // then validates every UNKNOWN/STALE entry using the worker pool.
-func runCheck(cfg *Config, store *Store, domains []string) {
+func runCheck(cfg *Config, store *Store, domains []string, verbose bool) {
 	added, err := store.AddDomains(domains)
 	if err != nil {
 		log.Printf("add domains: %v", err)
@@ -141,19 +139,19 @@ func runCheck(cfg *Config, store *Store, domains []string) {
 		log.Printf("added %d new domain(s) to repository", added)
 	}
 
-	v := NewValidator(cfg, store)
+	v := NewValidator(cfg, store, verbose)
 	results := v.RunBatch()
 	log.Printf("validated %d domain(s)", results)
+	ExportLists(cfg, store)
 }
 
-// runStaleRevalidation validates existing STALE/UNKNOWN entries
-// without first loading an input file. Used in run-mode inner loop.
-func runStaleRevalidation(cfg *Config, store *Store) {
-	v := NewValidator(cfg, store)
+func runStaleRevalidation(cfg *Config, store *Store, verbose bool) {
+	v := NewValidator(cfg, store, verbose)
 	results := v.RunBatch()
 	if results > 0 {
 		log.Printf("revalidated %d domain(s)", results)
 	}
+	ExportLists(cfg, store)
 }
 
 // runStats prints per-status counts from the repository.
