@@ -1,8 +1,10 @@
 // File    : rdap.go
-// Version : 1.3.0
-// Modified: 2026-04-01 16:54 UTC
+// Version : 1.5.0
+// Modified: 2026-04-01 19:07 UTC
 //
 // Changes:
+//   v1.5.0 - 2026-04-01 - Support context.Context; backoff applies to context timeouts
+//   v1.4.0 - 2026-04-01 - Apply throttle backoff on network timeouts and connection errors
 //   v1.3.0 - 2026-04-01 - Backoff on all non-2xx HTTP responses (excluding 404)
 //   v1.2.0 - 2026-04-01 - Standardised file header
 //   v1.1.0 - 2026-04-01 - Per-host throttle backoff on HTTP 429; Retry-After support
@@ -14,6 +16,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -87,8 +90,8 @@ func (c *RDAPClient) IsThrottled(apex string) bool {
 	return ok && time.Now().Before(until)
 }
 
-func (c *RDAPClient) Check(apex string) RDAPResult {
-	if err := c.ensureBootstrap(); err != nil {
+func (c *RDAPClient) Check(ctx context.Context, apex string) RDAPResult {
+	if err := c.ensureBootstrap(ctx); err != nil {
 		return RDAPResult{Error: "bootstrap: " + err.Error()}
 	}
 
@@ -114,8 +117,25 @@ func (c *RDAPClient) Check(apex string) RDAPResult {
 	c.mu.Unlock()
 
 	queryURL := strings.TrimSuffix(baseURL, "/") + "/domain/" + apex
-	resp, err := c.http.Get(queryURL)
-	if err != nil { return RDAPResult{Error: err.Error()} }
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, queryURL, nil)
+	if err != nil {
+		return RDAPResult{Error: "create request: " + err.Error()}
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		// Network error, timeout, or context cancellation. Apply backoff to this host.
+		backoff := c.throttleBackoff
+		until := time.Now().Add(backoff)
+		c.mu.Lock()
+		c.throttledUntil[host] = until
+		c.mu.Unlock()
+		log.Printf("rdap: network error/timeout connecting to %s — backing off until %s", host, until.Format(time.RFC3339))
+		return RDAPResult{
+			Throttled: true,
+			Error:     fmt.Sprintf("network error (%v) — throttled until %s", err, until.Format(time.RFC3339)),
+		}
+	}
 	defer resp.Body.Close()
 
 	is2xx := resp.StatusCode >= 200 && resp.StatusCode < 300
@@ -184,7 +204,7 @@ func (c *RDAPClient) findBaseURL(apex string) string {
 	return c.bootstrap[parts[len(parts)-1]]
 }
 
-func (c *RDAPClient) ensureBootstrap() error {
+func (c *RDAPClient) ensureBootstrap(ctx context.Context) error {
 	c.mu.Lock()
 	loaded := c.bootLoaded
 	c.mu.Unlock()
@@ -200,7 +220,10 @@ func (c *RDAPClient) ensureBootstrap() error {
 		}
 	}
 
-	resp, err := c.http.Get(c.bootURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.bootURL, nil)
+	if err != nil { return fmt.Errorf("create bootstrap request: %w", err) }
+
+	resp, err := c.http.Do(req)
 	if err != nil { return fmt.Errorf("download bootstrap: %w", err) }
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK { return fmt.Errorf("bootstrap HTTP %d", resp.StatusCode) }

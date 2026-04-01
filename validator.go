@@ -1,8 +1,9 @@
 // File    : validator.go
-// Version : 1.7.0
-// Modified: 2026-04-01 18:15 UTC
+// Version : 1.8.0
+// Modified: 2026-04-01 19:07 UTC
 //
 // Changes:
+//   v1.8.0 - 2026-04-01 - Pass context to RDAP Check to support context timeouts
 //   v1.7.0 - 2026-04-01 - Merge HasCNAME and CNAMETarget from sub-domain and apex checks
 //   v1.6.0 - 2026-04-01 - Also run DNS checks on the submitted domain when it
 //                          differs from the PSL apex
@@ -131,12 +132,7 @@ func (v *Validator) validateOne(domain string) *ValidationResult {
 		rdapCh <- rdapOut{res: RDAPResult{Throttled: true}}
 	} else {
 		go func() {
-			select {
-			case <-ctx.Done():
-				rdapCh <- rdapOut{res: RDAPResult{Error: "timeout"}}
-			default:
-				rdapCh <- rdapOut{res: v.rdap.Check(apex)}
-			}
+			rdapCh <- rdapOut{res: v.rdap.Check(ctx, apex)}
 		}()
 	}
 
