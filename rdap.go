@@ -1,14 +1,15 @@
 // File    : rdap.go
-// Version : 1.2.0
-// Modified: 2026-04-01 18:15 UTC
+// Version : 1.3.0
+// Modified: 2026-04-01 16:54 UTC
 //
 // Changes:
+//   v1.3.0 - 2026-04-01 - Backoff on all non-2xx HTTP responses (excluding 404)
 //   v1.2.0 - 2026-04-01 - Standardised file header
 //   v1.1.0 - 2026-04-01 - Per-host throttle backoff on HTTP 429; Retry-After support
 //   v1.0.0 - 2026-04-01 - Initial implementation
 //
 // Summary: RDAP (Registration Data Access Protocol) client. Handles dynamic lookup
-//          and robust HTTP 429 fallback/retrying.
+//          and robust HTTP throttle fallback/retrying on rate limits and server errors.
 
 package main
 
@@ -117,7 +118,12 @@ func (c *RDAPClient) Check(apex string) RDAPResult {
 	if err != nil { return RDAPResult{Error: err.Error()} }
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusTooManyRequests {
+	is2xx := resp.StatusCode >= 200 && resp.StatusCode < 300
+	is404 := resp.StatusCode == http.StatusNotFound
+
+	// Throttle on any non-2xx response, but explicitly exclude 404 (Not Found)
+	// because 404 is the standard RDAP response for an unregistered domain.
+	if !is2xx && !is404 {
 		backoff := c.throttleBackoff
 		if ra := resp.Header.Get("Retry-After"); ra != "" {
 			if secs, err2 := strconv.Atoi(ra); err2 == nil && secs > 0 {
@@ -128,12 +134,11 @@ func (c *RDAPClient) Check(apex string) RDAPResult {
 		c.mu.Lock()
 		c.throttledUntil[host] = until
 		c.mu.Unlock()
-		log.Printf("rdap: 429 from %s — backing off until %s", host, until.Format(time.RFC3339))
-		return RDAPResult{ Throttled: true, Error: fmt.Sprintf("HTTP 429 — throttled until %s", until.Format(time.RFC3339)) }
+		log.Printf("rdap: HTTP %d from %s — backing off until %s", resp.StatusCode, host, until.Format(time.RFC3339))
+		return RDAPResult{ Throttled: true, Error: fmt.Sprintf("HTTP %d — throttled until %s", resp.StatusCode, until.Format(time.RFC3339)) }
 	}
 
-	if resp.StatusCode == http.StatusNotFound { return RDAPResult{Active: false, StatusText: "not_registered"} }
-	if resp.StatusCode != http.StatusOK { return RDAPResult{Error: fmt.Sprintf("HTTP %d from %s", resp.StatusCode, queryURL)} }
+	if is404 { return RDAPResult{Active: false, StatusText: "not_registered"} }
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil { return RDAPResult{Error: "read body: " + err.Error()} }
