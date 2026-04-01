@@ -1,8 +1,9 @@
 // File    : config.go
-// Version : 1.4.0
-// Modified: 2026-04-01 19:00 UTC
+// Version : 1.5.0
+// Modified: 2026-04-01 18:15 UTC
 //
 // Changes:
+//   v1.5.0 - 2026-04-01 - Standardised file header
 //   v1.4.0 - 2026-04-01 - Added RootZone config section
 //   v1.3.0 - 2026-04-01 - Added RDAP.ThrottleBackoff (default 5m)
 //   v1.2.0 - 2026-04-01 - Added MinActiveScore (default 100)
@@ -22,7 +23,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config holds every tunable for dns-good. Field docs are in config.yaml.
 type Config struct {
 	DB struct {
 		Path string `yaml:"path"`
@@ -52,10 +52,6 @@ type Config struct {
 		ThrottleBackoff time.Duration `yaml:"throttle_backoff"`
 	} `yaml:"rdap"`
 
-	// RootZone enables the IANA root zone optimisation:
-	//   - skip the root server hop for any TLD with in-zone glue
-	//   - fast NXDOMAIN for domains whose TLD is not in the root zone
-	// Disable only if the root zone download is blocked in your environment.
 	RootZone struct {
 		Enabled    bool          `yaml:"enabled"`
 		URL        string        `yaml:"url"`
@@ -76,7 +72,6 @@ type Config struct {
 	} `yaml:"topn"`
 }
 
-// newDefaultConfig returns a fully populated Config with production-ready defaults.
 func newDefaultConfig() *Config {
 	c := &Config{}
 
@@ -121,8 +116,6 @@ func newDefaultConfig() *Config {
 	return c
 }
 
-// LoadConfig reads path into a Config, falling back gracefully to defaults
-// when the file does not exist or a field is absent from the YAML.
 func LoadConfig(path string) (*Config, error) {
 	cfg := newDefaultConfig()
 

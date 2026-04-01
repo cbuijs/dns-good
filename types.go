@@ -1,8 +1,9 @@
 // File    : types.go
-// Version : 1.2.0
-// Modified: 2026-04-01 18:00 UTC
+// Version : 1.3.0
+// Modified: 2026-04-01 18:15 UTC
 //
 // Changes:
+//   v1.3.0 - 2026-04-01 - Added HasCNAME and CNAMETarget to ValidationResult
 //   v1.2.0 - 2026-04-01 - Removed Postponed; added RDAPSkipped to ValidationResult
 //   v1.1.0 - 2026-04-01 - Added Throttled to RDAPResult; Postponed to ValidationResult
 //   v1.0.0 - 2026-04-01 - Initial implementation
@@ -40,7 +41,7 @@ const (
 	SourceTopN          ValidationSource = "TOP_N"          // Seen in Tranco/Umbrella top-N list
 	SourceRDAP          ValidationSource = "RDAP"           // RDAP confirms active registration
 	SourceDNSDelegation ValidationSource = "DNS_DELEGATION" // NS records exist (zone is delegated)
-	SourceDNSResolution ValidationSource = "DNS_RESOLUTION" // A or AAAA records resolve for the apex
+	SourceDNSResolution ValidationSource = "DNS_RESOLUTION" // A, AAAA, or CNAME records resolve for the apex
 )
 
 // Score weights per source. Max attainable is ScoreMax (250).
@@ -49,7 +50,7 @@ const (
 //	TOP_N          50  — presence in a well-known popularity list
 //	RDAP           50  — registry confirms active registration
 //	DNS_DELEGATION 50  — zone is delegated (NS records exist)
-//	DNS_RESOLUTION 100 — apex actually resolves to an IP (A or AAAA)
+//	DNS_RESOLUTION 100 — apex actually resolves to an IP (A, AAAA) or has a CNAME
 const (
 	ScoreTopN          = 50
 	ScoreRDAP          = 50
@@ -98,9 +99,11 @@ type ValidationResult struct {
 	HasNS     bool
 	NSRecords []string
 
-	// DNS resolution check — A/AAAA records for the apex.
-	HasA    bool
-	HasAAAA bool
+	// DNS resolution check — A, AAAA, or CNAME records for the apex.
+	HasA        bool
+	HasAAAA     bool
+	HasCNAME    bool
+	CNAMETarget string
 
 	// Computed by scorer.go after all checks complete.
 	Score   int

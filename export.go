@@ -1,21 +1,13 @@
 // File    : export.go
-// Version : 1.0.0
-// Modified: 2026-04-01 14:00 UTC
+// Version : 1.1.0
+// Modified: 2026-04-01 18:15 UTC
 //
 // Changes:
+//   v1.1.0 - 2026-04-01 - Standardised file header
 //   v1.0.0 - 2026-04-01 - Initial implementation
 //
 // Summary: Writes one text file per DomainStatus to a configured output
-//          directory after every validation pass. Each file contains one
-//          domain per line, sorted alphabetically, with a small header
-//          block for context. Writes are atomic (temp file + rename) so
-//          readers never see a partial file mid-update.
-//
-//          Output files:
-//            <output_dir>/active.txt
-//            <output_dir>/inactive.txt
-//            <output_dir>/stale.txt
-//            <output_dir>/unknown.txt
+//          directory after every validation pass. Atomic writes.
 
 package main
 
@@ -29,9 +21,6 @@ import (
 	"time"
 )
 
-// ExportLists writes one text file per status into cfg.Output.Dir.
-// Called after every validation batch. Non-fatal: errors are logged but
-// do not abort the run.
 func ExportLists(cfg *Config, store *Store) {
 	if cfg.Output.Dir == "" {
 		return
@@ -49,15 +38,12 @@ func ExportLists(cfg *Config, store *Store) {
 	}
 }
 
-// exportStatus fetches all entries for one status and writes them atomically.
 func exportStatus(cfg *Config, store *Store, status DomainStatus) error {
-	// Fetch all entries for this status.
 	entries, err := store.GetByStatus(status, 0)
 	if err != nil {
 		return fmt.Errorf("query: %w", err)
 	}
 
-	// Collect and sort domain names for deterministic, diff-friendly output.
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
 		names = append(names, e.Domain)
@@ -73,7 +59,6 @@ func exportStatus(cfg *Config, store *Store, status DomainStatus) error {
 		return fmt.Errorf("create temp file: %w", err)
 	}
 
-	// Header block — makes every file self-describing.
 	header := fmt.Sprintf(
 		"# dns-good — %s domains\n"+
 			"# Generated : %s\n"+
@@ -104,7 +89,6 @@ func exportStatus(cfg *Config, store *Store, status DomainStatus) error {
 		return fmt.Errorf("close temp file: %w", err)
 	}
 
-	// Atomic replace — readers never see a partial write.
 	if err := os.Rename(tmpPath, destPath); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("rename to %s: %w", destPath, err)
@@ -114,8 +98,6 @@ func exportStatus(cfg *Config, store *Store, status DomainStatus) error {
 	return nil
 }
 
-// scoreNote returns a one-line explanation of what the status means,
-// printed in each file's header for human readers.
 func scoreNote(status DomainStatus) string {
 	switch status {
 	case StatusActive:

@@ -1,16 +1,12 @@
 // File    : go.mod
-// Version : 1.0.0
-// Modified: 2026-04-01 12:00 UTC
+// Version : 1.1.0
+// Modified: 2026-04-01 18:15 UTC
 //
 // Changes:
+//   v1.1.0 - 2026-04-01 - Standardised file header
 //   v1.0.0 - 2026-04-01 - Initial implementation
 //
 // Summary: Module definition for dns-good.
-//          Run "go mod tidy" after cloning to pull indirect deps and
-//          generate go.sum. Three direct dependencies:
-//            github.com/miekg/dns  — iterative DNS resolution
-//            modernc.org/sqlite    — pure-Go SQLite (no CGO required)
-//            gopkg.in/yaml.v3      — config file parsing
 
 module dns-good
 

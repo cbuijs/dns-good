@@ -1,8 +1,9 @@
 // File    : resolver.go
-// Version : 1.2.0
-// Modified: 2026-04-01 19:00 UTC
+// Version : 1.3.0
+// Modified: 2026-04-01 18:15 UTC
 //
 // Changes:
+//   v1.3.0 - 2026-04-01 - Add SOA check to fix "no referral", add CNAME checking, TCP fallback for glueless NS
 //   v1.2.0 - 2026-04-01 - Root zone integration: skip root hop for known TLDs;
 //                          fast NXDOMAIN on unknown TLDs; extractTLD moved to apex.go
 //   v1.1.0 - 2026-04-01 - SERVFAIL from one server no longer kills resolution;
@@ -12,25 +13,6 @@
 // Summary: Self-contained iterative DNS resolver. Walks the delegation
 //          chain from root → TLD → authoritative NS ourselves, without
 //          relying on any upstream recursive resolver for target domains.
-//
-//          HOW IT WORKS — two completely different modes, don't confuse them:
-//
-//          ITERATIVE (used for target domains):
-//            We do the work. Start from root (or TLD NS if root zone cache
-//            has glue) → follow NS referrals → get final answer.
-//            RecursionDesired = false on all queries.
-//
-//          RECURSIVE (used only for glueless NS hostnames):
-//            We delegate the work to a public resolver. RecursionDesired = true.
-//            Used only when a referral has no glue records — a pragmatic
-//            trade-off for NS infrastructure hostnames only.
-//
-//          ROOT ZONE OPTIMISATION:
-//            When a RootZone is provided and has glue IPs for a TLD, the root
-//            server query is skipped entirely — we start directly at the TLD
-//            nameservers. Three queries are saved per domain (NS + A + AAAA
-//            each start from root in the normal path). Unknown TLDs (not in
-//            root zone) get an immediate NXDOMAIN without any network round trip.
 
 package main
 
@@ -45,8 +27,6 @@ import (
 )
 
 // ianaRootServers is the complete set of IANA root server IPv4 addresses.
-// One is picked at random per resolution attempt to spread load across
-// the anycast clusters. Updated list: https://www.iana.org/domains/root/servers
 var ianaRootServers = []string{
 	"198.41.0.4",     // a.root-servers.net
 	"170.247.170.2",  // b.root-servers.net
@@ -65,28 +45,28 @@ var ianaRootServers = []string{
 
 // publicFallbackResolvers is used ONLY to resolve NS hostnames when no
 // glue records are present in a referral (glueless delegation).
-// These are NOT used for target domains themselves.
 var publicFallbackResolvers = []string{
 	"1.1.1.1:53", // Cloudflare
 	"8.8.8.8:53", // Google
 	"9.9.9.9:53", // Quad9
 }
 
-// NXDomainError signals that the DNS hierarchy returned NXDOMAIN —
-// the domain name does not exist anywhere in the tree.
+// NXDomainError signals that the DNS hierarchy returned NXDOMAIN.
 type NXDomainError struct{ Name string }
 
 func (e *NXDomainError) Error() string { return "NXDOMAIN: " + e.Name }
 
 // ResolveResult holds everything the iterative resolver found.
 type ResolveResult struct {
-	HasNS   bool
-	HasA    bool
-	HasAAAA bool
-	NS      []string // authoritative NS hostnames for the apex
-	A       []net.IP
-	AAAA    []net.IP
-	Errors  []string // non-fatal issues (e.g. one NS timed out but another answered)
+	HasNS       bool
+	HasA        bool
+	HasAAAA     bool
+	HasCNAME    bool
+	CNAMETarget string
+	NS          []string // authoritative NS hostnames for the apex
+	A           []net.IP
+	AAAA        []net.IP
+	Errors      []string // non-fatal issues
 }
 
 // Resolver performs iterative (from-scratch) DNS lookups.
@@ -99,7 +79,6 @@ type Resolver struct {
 }
 
 // NewResolver creates a Resolver with the given settings.
-// rz may be nil — root zone optimisation is simply disabled when not provided.
 func NewResolver(maxDepth, retries int, timeout time.Duration, rz *RootZone) *Resolver {
 	return &Resolver{
 		maxDepth: maxDepth,
@@ -110,9 +89,7 @@ func NewResolver(maxDepth, retries int, timeout time.Duration, rz *RootZone) *Re
 	}
 }
 
-// CheckDomain runs a full iterative check for an apex domain:
-//  1. Resolves NS records (confirms zone delegation exists).
-//  2. Resolves A and AAAA records for the apex from those authoritative servers.
+// CheckDomain runs a full iterative check for an apex domain.
 func (r *Resolver) CheckDomain(apex string) *ResolveResult {
 	res := &ResolveResult{}
 	fqdn := dns.Fqdn(strings.ToLower(apex))
@@ -123,7 +100,6 @@ func (r *Resolver) CheckDomain(apex string) *ResolveResult {
 		if !isNXDomain(err) {
 			res.Errors = append(res.Errors, "NS: "+err.Error())
 		}
-		// NXDOMAIN → HasNS stays false — correct result
 	} else {
 		for _, rr := range append(nsResp.Answer, nsResp.Ns...) {
 			if ns, ok := rr.(*dns.NS); ok {
@@ -159,19 +135,25 @@ func (r *Resolver) CheckDomain(apex string) *ResolveResult {
 		}
 	}
 
+	// --- CNAME check (ensures domains correctly register as ACTIVE even if targets fail) ---
+	cnameResp, err := r.iterativeResolve(fqdn, dns.TypeCNAME)
+	if err != nil && !isNXDomain(err) {
+		res.Errors = append(res.Errors, "CNAME: "+err.Error())
+	} else if cnameResp != nil {
+		for _, rr := range cnameResp.Answer {
+			if c, ok := rr.(*dns.CNAME); ok {
+				res.HasCNAME = true
+				res.CNAMETarget = trimFQDN(c.Target)
+			}
+		}
+	}
+
 	return res
 }
 
 // iterativeResolve walks the DNS hierarchy from root (or TLD when root zone
 // cache has glue), following NS referrals at each level, until it gets an
 // authoritative answer for name/qtype.
-//
-// Root zone shortcut: when r.rootZone is set and has glue IPs for name's TLD,
-// the first hop (root → TLD NS) is skipped — we start directly at the TLD
-// nameservers. Unknown TLDs return NXDomainError immediately.
-//
-// CNAME chains are followed up to 8 hops by restarting the walk for the target.
-// Each restart also benefits from the root zone cache for its own TLD.
 func (r *Resolver) iterativeResolve(name string, qtype uint16) (*dns.Msg, error) {
 	servers, err := r.startingServers(name)
 	if err != nil {
@@ -189,14 +171,10 @@ func (r *Resolver) iterativeResolve(name string, qtype uint16) (*dns.Msg, error)
 		case dns.RcodeNameError: // NXDOMAIN
 			return nil, &NXDomainError{Name: name}
 		case dns.RcodeServerFailure:
-			// query() only surfaces SERVFAIL here when ALL servers in the
-			// current set returned it — single-server failures are silently
-			// retried against the other servers in the set.
 			return nil, fmt.Errorf("SERVFAIL for %s (all authoritative servers failed)", name)
 		}
 
 		if len(resp.Answer) > 0 {
-			// Follow CNAME chains unless we're specifically querying for CNAME.
 			if qtype != dns.TypeCNAME {
 				if target := extractCNAMETarget(resp); target != "" {
 					if cnameHops >= 8 {
@@ -205,7 +183,6 @@ func (r *Resolver) iterativeResolve(name string, qtype uint16) (*dns.Msg, error)
 					name = dns.Fqdn(strings.ToLower(target))
 					cnameHops++
 					depth = -1 // post-increment brings this to 0 at loop top
-					// Restart walk from root (or TLD NS) for the CNAME target.
 					servers, err = r.startingServers(name)
 					if err != nil {
 						return nil, err
@@ -217,8 +194,9 @@ func (r *Resolver) iterativeResolve(name string, qtype uint16) (*dns.Msg, error)
 		}
 
 		// AA=true, empty Answer → NODATA (type absent, domain exists).
-		// Return so the caller can inspect the Authority section.
-		if resp.Authoritative {
+		// Or if it contains an SOA record in Authority section, it's a terminal response.
+		// (Many DNS servers return NXDOMAIN/NODATA without AA=true but with an SOA)
+		if resp.Authoritative || hasSOA(resp) {
 			return resp, nil
 		}
 
@@ -239,39 +217,26 @@ func (r *Resolver) iterativeResolve(name string, qtype uint16) (*dns.Msg, error)
 }
 
 // startingServers returns the initial server list for iterativeResolve.
-// When the root zone cache has glue IPs for name's TLD, those are returned
-// directly (skipping the root hop). Falls back to a random root server
-// when root zone is disabled, not loaded, or has no glue for this TLD.
-// Returns NXDomainError when the root zone is loaded and the TLD is unknown.
 func (r *Resolver) startingServers(name string) ([]string, error) {
 	tld := extractTLD(name)
 	if r.rootZone != nil {
-		// Pre-flight: if the TLD doesn't exist in the root zone at all, no
-		// amount of querying will produce a result — fail fast.
 		if !r.rootZone.KnownTLD(tld) {
 			return nil, &NXDomainError{Name: name}
 		}
-		// Use TLD NS IPs from glue — one fewer hop per domain per query type.
 		if ips, ok := r.rootZone.NSForTLD(tld); ok {
 			return ips, nil
 		}
-		// TLD is known but has no in-zone glue (some ccTLDs use out-of-zone NS).
-		// Fall through to root server — we'll get the referral from there.
 	}
 	return []string{randomRootServer() + ":53"}, nil
 }
 
 // query sends name/qtype to each server in shuffled order with UDP,
 // falling back to TCP on truncation.
-//
-// SERVFAIL from a single server is treated as a soft failure: we move on to
-// the next server in the set. Only when ALL servers return SERVFAIL (or time
-// out) is the failure surfaced to the caller.
 func (r *Resolver) query(name string, qtype uint16, servers []string) (*dns.Msg, error) {
 	m := new(dns.Msg)
 	m.SetQuestion(name, qtype)
-	m.RecursionDesired = false // we walk the chain ourselves
-	m.SetEdns0(1232, false)    // RFC 8085 recommended buffer size
+	m.RecursionDesired = false
+	m.SetEdns0(1232, false)
 
 	shuffled := make([]string, len(servers))
 	copy(shuffled, servers)
@@ -298,7 +263,7 @@ func (r *Resolver) query(name string, qtype uint16, servers []string) (*dns.Msg,
 				lastErr = fmt.Errorf("SERVFAIL from %s for %s %s",
 					srv, name, dns.TypeToString[qtype])
 				servfailResp = resp
-				break // try next server
+				break
 			}
 			return resp, nil
 		}
@@ -311,10 +276,7 @@ func (r *Resolver) query(name string, qtype uint16, servers []string) (*dns.Msg,
 		name, dns.TypeToString[qtype], lastErr)
 }
 
-// resolveNStoIPs maps NS hostnames to IP address strings.
-// Glue records from the referral are used first; glueless delegations fall
-// back to a public recursive resolver (see file header for reasoning).
-// Capped at 4 NS servers to keep the number of lookups bounded.
+// resolveNStoIPs maps NS hostnames to IP address strings using glue or public resolvers.
 func (r *Resolver) resolveNStoIPs(names []string, glue map[string][]string) []string {
 	limit := 4
 	if len(names) < limit {
@@ -334,15 +296,22 @@ func (r *Resolver) resolveNStoIPs(names []string, glue map[string][]string) []st
 			}
 			continue
 		}
+		
 		// Glueless — ask a public recursive resolver for NS hostname A records.
 		for _, pub := range publicFallbackResolvers {
 			m := new(dns.Msg)
 			m.SetQuestion(dns.Fqdn(name), dns.TypeA)
 			m.RecursionDesired = true
+			
 			resp, _, err := r.udp.Exchange(m, pub)
+			// TCP fallback for truncated responses on public resolvers
+			if err == nil && resp != nil && resp.Truncated {
+				resp, _, err = r.tcp.Exchange(m, pub)
+			}
 			if err != nil || resp == nil {
 				continue
 			}
+			
 			found := false
 			for _, rr := range resp.Answer {
 				if a, ok := rr.(*dns.A); ok {
@@ -387,8 +356,17 @@ func extractNSNames(msg *dns.Msg) []string {
 	return ns
 }
 
-// extractGlue collects A and AAAA records from the Additional section,
-// keyed by hostname — these accompany NS referrals as glue records.
+// hasSOA returns true if the authority section contains an SOA record.
+// This identifies NODATA/NXDOMAIN responses that lack the AA bit.
+func hasSOA(msg *dns.Msg) bool {
+	for _, rr := range msg.Ns {
+		if _, ok := rr.(*dns.SOA); ok {
+			return true
+		}
+	}
+	return false
+}
+
 func extractGlue(msg *dns.Msg) map[string][]string {
 	glue := make(map[string][]string)
 	for _, rr := range msg.Extra {
@@ -404,8 +382,6 @@ func extractGlue(msg *dns.Msg) map[string][]string {
 	return glue
 }
 
-// extractCNAMETarget returns the first CNAME target in the Answer section,
-// or empty string when none is present.
 func extractCNAMETarget(msg *dns.Msg) string {
 	for _, rr := range msg.Answer {
 		if c, ok := rr.(*dns.CNAME); ok {
@@ -415,8 +391,6 @@ func extractCNAMETarget(msg *dns.Msg) string {
 	return ""
 }
 
-// addPort appends ":port" to each bare IP string.
-// IPv6 addresses are wrapped in brackets to produce valid dial strings.
 func addPort(ips []string, port string) []string {
 	out := make([]string, 0, len(ips))
 	for _, ip := range ips {
