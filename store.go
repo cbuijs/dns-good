@@ -1,0 +1,286 @@
+// File    : store.go
+// Version : 1.0.0
+// Modified: 2026-04-01 12:00 UTC
+//
+// Changes:
+//   v1.0.0 - 2026-04-01 - Initial implementation
+//
+// Summary: SQLite-backed domain repository. Handles all persistence,
+//          staleness management, and bulk queries. WAL journal mode
+//          allows concurrent reads; SetMaxOpenConns(1) serialises writes.
+//          Pure-Go driver (modernc.org/sqlite) — no CGO required.
+
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	_ "modernc.org/sqlite" // registers the "sqlite" driver
+)
+
+// schema is applied on every startup (all statements are IF NOT EXISTS).
+const schema = `
+CREATE TABLE IF NOT EXISTS domains (
+    id           INTEGER  PRIMARY KEY AUTOINCREMENT,
+    domain       TEXT     UNIQUE NOT NULL,
+    apex         TEXT     NOT NULL DEFAULT '',
+    status       TEXT     NOT NULL DEFAULT 'UNKNOWN',
+    score        INTEGER  NOT NULL DEFAULT 0,
+    first_seen   DATETIME,                          -- set once, never overwritten
+    last_active  DATETIME,                          -- updated only when status = ACTIVE
+    last_checked DATETIME,                          -- updated on every validation attempt
+    sources      TEXT     NOT NULL DEFAULT '[]',    -- JSON array of ValidationSource strings
+    raw_data     TEXT     NOT NULL DEFAULT '{}',    -- JSON blob of last full ValidationResult
+    created_at   DATETIME NOT NULL DEFAULT (datetime('now')),
+    updated_at   DATETIME NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_status        ON domains(status);
+CREATE INDEX IF NOT EXISTS idx_last_checked  ON domains(last_checked);
+CREATE INDEX IF NOT EXISTS idx_apex          ON domains(apex);
+`
+
+// Store wraps a SQLite database with domain-oriented operations.
+type Store struct {
+	db *sql.DB
+}
+
+// NewStore opens (or creates) the SQLite database at path and applies the schema.
+func NewStore(path string) (*Store, error) {
+	// WAL = concurrent readers; _timeout lets writers wait up to 5s for the lock.
+	db, err := sql.Open("sqlite", path+"?_journal=WAL&_timeout=5000")
+	if err != nil {
+		return nil, fmt.Errorf("open db %q: %w", path, err)
+	}
+	db.SetMaxOpenConns(1) // one writer at a time — SQLite WAL constraint
+	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("apply schema: %w", err)
+	}
+	return &Store{db: db}, nil
+}
+
+// Close releases the database handle.
+func (s *Store) Close() error { return s.db.Close() }
+
+// Upsert inserts a new domain entry or updates an existing one.
+//   - first_seen is set only on the first insert; never overwritten after that.
+//   - last_active is only updated when the result status is ACTIVE.
+//   - Everything else reflects the latest validation.
+func (s *Store) Upsert(r *ValidationResult) error {
+	sources, _ := json.Marshal(r.Sources)
+	rawData, _ := json.Marshal(r)
+
+	// Only stamp last_active when the domain is live.
+	var lastActive interface{} = nil
+	if r.Status == StatusActive {
+		lastActive = r.CheckedAt
+	}
+
+	_, err := s.db.Exec(`
+		INSERT INTO domains
+			(domain, apex, status, score, first_seen, last_active, last_checked, sources, raw_data)
+		VALUES
+			(?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(domain) DO UPDATE SET
+			apex         = excluded.apex,
+			status       = excluded.status,
+			score        = excluded.score,
+			first_seen   = COALESCE(first_seen, excluded.first_seen),
+			last_active  = CASE WHEN excluded.last_active IS NOT NULL
+			                    THEN excluded.last_active
+			                    ELSE last_active END,
+			last_checked = excluded.last_checked,
+			sources      = excluded.sources,
+			raw_data     = excluded.raw_data,
+			updated_at   = datetime('now')
+	`,
+		r.Domain, r.Apex, string(r.Status), r.Score,
+		r.CheckedAt, lastActive, r.CheckedAt,
+		string(sources), string(rawData),
+	)
+	return err
+}
+
+// AddDomains bulk-inserts domains with status UNKNOWN (never checked).
+// Existing domains are silently skipped (INSERT OR IGNORE).
+// Returns the number of newly added rows.
+func (s *Store) AddDomains(domains []string) (added int, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+
+	stmt, err := tx.Prepare(`
+		INSERT OR IGNORE INTO domains (domain, apex, status, sources, raw_data)
+		VALUES (?, ?, 'UNKNOWN', '[]', '{}')
+	`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+
+	for _, d := range domains {
+		d = strings.ToLower(strings.TrimSpace(d))
+		if d == "" {
+			continue
+		}
+		res, err2 := stmt.Exec(d, extractApex(d))
+		if err2 != nil {
+			err = err2
+			return added, err
+		}
+		n, _ := res.RowsAffected()
+		added += int(n)
+	}
+	return added, tx.Commit()
+}
+
+// GetNeedingValidation returns up to limit domains with status UNKNOWN or STALE,
+// ordered oldest-checked-first so the most overdue entries get priority.
+// Call MarkStaleEntries first to transition old ACTIVE/INACTIVE rows to STALE.
+func (s *Store) GetNeedingValidation(limit int) ([]*DomainEntry, error) {
+	rows, err := s.db.Query(`
+		SELECT id, domain, apex, status, score,
+		       first_seen, last_active, last_checked, sources
+		FROM   domains
+		WHERE  status IN ('UNKNOWN', 'STALE')
+		ORDER  BY last_checked ASC NULLS FIRST
+		LIMIT  ?
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEntries(rows)
+}
+
+// MarkStaleEntries flips ACTIVE and INACTIVE rows whose last_checked is older
+// than staleTTL to STALE so they get picked up for revalidation.
+// Returns the number of rows updated.
+func (s *Store) MarkStaleEntries(staleTTL time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-staleTTL)
+	res, err := s.db.Exec(`
+		UPDATE domains
+		SET    status = 'STALE', updated_at = datetime('now')
+		WHERE  status IN ('ACTIVE', 'INACTIVE')
+		  AND  (last_checked IS NULL OR last_checked < ?)
+	`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// Stats returns a row count per status value.
+func (s *Store) Stats() (map[string]int64, error) {
+	rows, err := s.db.Query(`SELECT status, COUNT(*) FROM domains GROUP BY status`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]int64)
+	for rows.Next() {
+		var st string
+		var n int64
+		if err := rows.Scan(&st, &n); err != nil {
+			return nil, err
+		}
+		out[st] = n
+	}
+	return out, rows.Err()
+}
+
+// GetAll returns all domain entries, ordered by score desc then domain asc.
+// Supports pagination via limit/offset for large exports.
+func (s *Store) GetAll(limit, offset int) ([]*DomainEntry, error) {
+	rows, err := s.db.Query(`
+		SELECT id, domain, apex, status, score,
+		       first_seen, last_active, last_checked, sources
+		FROM   domains
+		ORDER  BY score DESC, domain ASC
+		LIMIT  ? OFFSET ?
+	`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEntries(rows)
+}
+
+// GetByStatus returns entries filtered to a specific status, ordered by score desc.
+func (s *Store) GetByStatus(status DomainStatus, limit int) ([]*DomainEntry, error) {
+	rows, err := s.db.Query(`
+		SELECT id, domain, apex, status, score,
+		       first_seen, last_active, last_checked, sources
+		FROM   domains
+		WHERE  status = ?
+		ORDER  BY score DESC, last_checked DESC
+		LIMIT  ?
+	`, string(status), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEntries(rows)
+}
+
+// scanEntries maps SQL rows to DomainEntry structs.
+func scanEntries(rows *sql.Rows) ([]*DomainEntry, error) {
+	var out []*DomainEntry
+	for rows.Next() {
+		e := &DomainEntry{}
+		var srcJSON string
+		var firstSeen, lastActive, lastChecked sql.NullTime
+		if err := rows.Scan(
+			&e.ID, &e.Domain, &e.Apex,
+			&e.Status, &e.Score,
+			&firstSeen, &lastActive, &lastChecked,
+			&srcJSON,
+		); err != nil {
+			return nil, err
+		}
+		if firstSeen.Valid  { e.FirstSeen  = firstSeen.Time  }
+		if lastActive.Valid { e.LastActive = lastActive.Time }
+		if lastChecked.Valid{ e.LastChecked= lastChecked.Time}
+		_ = json.Unmarshal([]byte(srcJSON), &e.Sources)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// extractApex derives the registered/apex domain from a FQDN.
+// Uses a small built-in table for common compound TLDs (co.uk, com.au, etc.).
+// For full accuracy with all ccTLDs, swap this for a Public Suffix List library.
+func extractApex(domain string) string {
+	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
+	parts := strings.Split(domain, ".")
+	if len(parts) <= 2 {
+		return domain
+	}
+	// Compound TLDs where the apex needs 3 labels.
+	compound := map[string]bool{
+		"co.uk": true, "org.uk": true, "me.uk": true, "net.uk": true,
+		"com.au": true, "net.au": true, "org.au": true,
+		"co.nz": true, "net.nz": true, "org.nz": true,
+		"co.za": true, "org.za": true,
+		"co.jp": true, "or.jp": true, "ne.jp": true,
+		"com.br": true, "net.br": true, "org.br": true,
+		"com.mx": true, "net.mx": true,
+		"com.ar": true, "net.ar": true,
+	}
+	last2 := parts[len(parts)-2] + "." + parts[len(parts)-1]
+	if compound[last2] && len(parts) >= 3 {
+		return strings.Join(parts[len(parts)-3:], ".")
+	}
+	return strings.Join(parts[len(parts)-2:], ".")
+}
+

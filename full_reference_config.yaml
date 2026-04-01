@@ -1,0 +1,57 @@
+# File    : config.yaml
+# Version : 1.0.0
+# Modified: 2026-04-01 12:00 UTC
+#
+# Changes:
+#   v1.0.0 - 2026-04-01 - Initial implementation
+#
+# Summary: Runtime configuration for dns-good. All values shown
+#          are the built-in defaults. Comment out or remove any
+#          field to fall back to the default. Missing file = all defaults.
+
+db:
+  path: dns-good.db             # SQLite file; created automatically if absent
+
+validation:
+  workers: 20                   # Goroutines running domain checks in parallel
+  stale_ttl: 24h                # After this, an ACTIVE/INACTIVE entry becomes STALE
+  revalidate_delay: 4h          # Pause between "run" mode ticks
+  timeout: 15s                  # Hard per-domain deadline across all checks combined
+
+dns:
+  # All 13 IANA root server IPv4 addresses. One is picked at random per
+  # resolution attempt to avoid hammering a single anycast node.
+  root_servers:
+    - "198.41.0.4"              # a.root-servers.net
+    - "170.247.170.2"           # b.root-servers.net
+    - "192.33.4.12"             # c.root-servers.net
+    - "199.7.91.13"             # d.root-servers.net
+    - "192.203.230.10"          # e.root-servers.net
+    - "192.5.5.241"             # f.root-servers.net
+    - "192.112.36.4"            # g.root-servers.net
+    - "198.97.190.53"           # h.root-servers.net
+    - "192.36.148.17"           # i.root-servers.net
+    - "192.58.128.30"           # j.root-servers.net
+    - "193.0.14.129"            # k.root-servers.net
+    - "199.7.83.42"             # l.root-servers.net
+    - "202.12.27.33"            # m.root-servers.net
+  max_depth: 12                 # Max NS referral hops before declaring a resolution failure
+  retries: 2                    # UDP retry attempts per name server before moving on
+  timeout: 5s                   # Per-query timeout; TCP fallback gets 2x this
+
+rdap:
+  # IANA bootstrap registry maps TLDs to their RDAP service base URLs.
+  bootstrap_url: "https://data.iana.org/rdap/dns.json"
+  cache_path: rdap-bootstrap.json   # Local cache of the bootstrap JSON
+  cache_ttl: 48h                    # Re-download bootstrap after this period
+  timeout: 10s                      # HTTP read timeout per RDAP query
+  min_gap_ms: 500                   # Min milliseconds between requests to the same RDAP host
+                                    # (500ms ≈ 2 req/s max per registry — polite default)
+
+topn:
+  provider: tranco               # "tranco" is the only supported provider right now
+  url: "https://tranco-list.eu/top-1m.csv.zip"
+  cache_path: tranco.csv         # Unzipped CSV is written here after first download
+  refresh_ttl: 24h               # Re-download the list after this period
+  size: 1000000                  # Load the top N entries (set lower to reduce memory use)
+
