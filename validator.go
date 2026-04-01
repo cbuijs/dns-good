@@ -1,8 +1,11 @@
 // File    : validator.go
-// Version : 1.5.0
-// Modified: 2026-04-01 20:00 UTC
+// Version : 1.6.0
+// Modified: 2026-04-01 21:00 UTC
 //
 // Changes:
+//   v1.6.0 - 2026-04-01 - Also run DNS checks on the submitted domain when it
+//                          differs from the PSL apex; fixes false-INACTIVE for
+//                          separately delegated subdomains (e.g. arc2.msn.com)
 //   v1.5.0 - 2026-04-01 - RunBatch accepts context.Context; stops queuing new
 //                          domains on cancellation while in-flight work finishes
 //   v1.4.0 - 2026-04-01 - RDAP throttle skips only RDAP; DNS+TOP-N still run and score
@@ -17,16 +20,23 @@
 //          to cfg.Validation.Workers goroutines at any time. Each domain
 //          gets a hard deadline of cfg.Validation.Timeout.
 //
+//          Subdomain DNS: RDAP and TOP-N are registry-level concepts and
+//          always use the PSL apex. DNS delegation and resolution are
+//          checked at BOTH the apex and the submitted domain when they
+//          differ. This means a separately delegated subdomain like
+//          arc2.msn.com contributes its own NS and A records to the score
+//          even when the apex (msn.com) has no direct A records at the zone
+//          root (e.g. CDN ALIAS/ANAME setups that only resolve for recursive
+//          clients, not iterative ones).
+//
 //          Graceful shutdown: RunBatch accepts a context. Before launching
 //          each new domain goroutine it checks ctx.Done(). On cancellation
 //          it stops queuing new work but calls wg.Wait() so every goroutine
-//          that is already running completes and persists its result. The
-//          caller (runCheck/runStaleRevalidation) then exports and closes.
+//          that is already running completes and persists its result.
 //
 //          RDAP throttle handling: when the RDAP registry host for a domain
 //          is in a 429 backoff window, the RDAP check is silently skipped
-//          (RDAPSkipped=true). DNS and TOP-N still run normally. The domain
-//          is scored and persisted — it can reach ACTIVE without RDAP.
+//          (RDAPSkipped=true). DNS and TOP-N still run normally.
 
 package main
 
@@ -126,10 +136,12 @@ func (v *Validator) RunBatch(ctx context.Context, batch int) int {
 // validateOne runs all available checks for a single domain within a deadline.
 // Non-fatal errors from individual checks are collected in result.Errors.
 //
-// When the RDAP registry for this domain is throttled, the RDAP check is
-// skipped (result.RDAPSkipped = true) but every other check runs normally.
-// The domain is always scored and written to the store — it can reach ACTIVE
-// on DNS evidence alone.
+// DNS strategy: RDAP and TOP-N are always checked against the PSL apex —
+// they are registry-level signals. DNS is checked against BOTH the apex
+// and the submitted domain when they differ, and the results are merged
+// with OR logic (evidence from either counts). This handles separately
+// delegated subdomains like arc2.msn.com, whose own NS and A records are
+// real live-domain evidence that the apex-only check would miss entirely.
 func (v *Validator) validateOne(domain string) *ValidationResult {
 	ctx, cancel := context.WithTimeout(context.Background(), v.cfg.Validation.Timeout)
 	defer cancel()
@@ -144,8 +156,15 @@ func (v *Validator) validateOne(domain string) *ValidationResult {
 	type rdapOut struct{ res RDAPResult }
 	type dnsOut  struct{ res *ResolveResult }
 
-	rdapCh := make(chan rdapOut, 1)
-	dnsCh  := make(chan dnsOut,  1)
+	rdapCh    := make(chan rdapOut, 1)
+	apexDNSCh := make(chan dnsOut,  1)
+
+	// subDNSCh carries the result of checking the submitted domain directly.
+	// It is only used when the submitted domain differs from the PSL apex.
+	// When they are the same, we send a nil sentinel so the collect step
+	// below is unconditional and doesn't need a special case.
+	subDNSCh := make(chan dnsOut, 1)
+	checkSub := domain != apex
 
 	// --- TOP-N (in-memory, non-blocking) ---
 	rank := v.topn.Rank(apex)
@@ -170,15 +189,34 @@ func (v *Validator) validateOne(domain string) *ValidationResult {
 		}()
 	}
 
-	// --- DNS delegation + resolution (iterative, always runs) ---
+	// --- DNS: apex (always) ---
 	go func() {
 		select {
 		case <-ctx.Done():
-			dnsCh <- dnsOut{res: &ResolveResult{Errors: []string{"timeout"}}}
+			apexDNSCh <- dnsOut{res: &ResolveResult{Errors: []string{"timeout"}}}
 		default:
-			dnsCh <- dnsOut{res: v.resolver.CheckDomain(apex)}
+			apexDNSCh <- dnsOut{res: v.resolver.CheckDomain(apex)}
 		}
 	}()
+
+	// --- DNS: submitted domain (only when it differs from the apex) ---
+	// Examples where this fires:
+	//   arc2.msn.com  — separately delegated zone inside msn.com with own A records
+	//   cdn.example.co.uk — own NS delegation under a compound-TLD apex
+	// Examples where this does NOT fire (domain == apex):
+	//   google.com, msn.com, example.co.uk — submitted at the registered apex
+	if checkSub {
+		go func() {
+			select {
+			case <-ctx.Done():
+				subDNSCh <- dnsOut{res: &ResolveResult{Errors: []string{"timeout"}}}
+			default:
+				subDNSCh <- dnsOut{res: v.resolver.CheckDomain(domain)}
+			}
+		}()
+	} else {
+		subDNSCh <- dnsOut{res: nil} // sentinel: no sub-check needed
+	}
 
 	// Collect RDAP result.
 	select {
@@ -199,9 +237,9 @@ func (v *Validator) validateOne(domain string) *ValidationResult {
 		result.Errors = append(result.Errors, "rdap: context deadline exceeded")
 	}
 
-	// Collect DNS result.
+	// Collect apex DNS result.
 	select {
-	case out := <-dnsCh:
+	case out := <-apexDNSCh:
 		r := out.res
 		result.HasNS     = r.HasNS
 		result.HasA      = r.HasA
@@ -209,7 +247,33 @@ func (v *Validator) validateOne(domain string) *ValidationResult {
 		result.NSRecords = r.NS
 		result.Errors    = append(result.Errors, r.Errors...)
 	case <-ctx.Done():
-		result.Errors = append(result.Errors, "dns: context deadline exceeded")
+		result.Errors = append(result.Errors, "dns (apex): context deadline exceeded")
+	}
+
+	// Collect submitted-domain DNS result and merge with OR logic.
+	// Any positive DNS evidence from the submitted domain is treated as
+	// equivalent to evidence from the apex — the domain is live if either
+	// the apex or the submitted subdomain resolves.
+	select {
+	case out := <-subDNSCh:
+		if r := out.res; r != nil {
+			if r.HasNS {
+				result.HasNS = true
+				result.NSRecords = append(result.NSRecords, r.NS...)
+			}
+			if r.HasA {
+				result.HasA = true
+			}
+			if r.HasAAAA {
+				result.HasAAAA = true
+			}
+			// Prefix sub-domain errors so they're distinguishable in logs.
+			for _, e := range r.Errors {
+				result.Errors = append(result.Errors, "dns (sub): "+e)
+			}
+		}
+	case <-ctx.Done():
+		result.Errors = append(result.Errors, "dns (sub): context deadline exceeded")
 	}
 
 	// Score and assign final status based on whatever sources are available.
