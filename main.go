@@ -1,8 +1,11 @@
 // File    : main.go
-// Version : 1.6.0
-// Modified: 2026-04-01 18:15 UTC
+// Version : 1.9.0
+// Modified: 2026-04-02 10:15 UTC
 //
 // Changes:
+//   v1.9.0 - 2026-04-02 - Randomise and round-robin sort input domains by TLD to reduce throttling
+//   v1.8.0 - 2026-04-02 - Add -debug flag to separate DNS tracing from standard verbose logging
+//   v1.7.0 - 2026-04-02 - Pass verbose flag to NewResolver for detailed DNS tracing
 //   v1.6.0 - 2026-04-01 - Standardised file header
 //   v1.5.0 - 2026-04-01 - Graceful shutdown via context: Ctrl-C finishes in-flight work
 //   v1.4.0 - 2026-04-01 - Wire up RootZone; pass it to NewResolver
@@ -22,6 +25,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"strings"
@@ -35,6 +39,7 @@ func main() {
 	inputFile  := flag.String("input",   "",            "File with one domain per line (check/run mode)")
 	workers    := flag.Int(   "workers",  0,            "Override validation worker count (0 = use config)")
 	verbose    := flag.Bool(  "verbose", false,         "Print one progress line per domain")
+	debug      := flag.Bool(  "debug",   false,         "Enable detailed DNS iterative tracing")
 	outputDir  := flag.String("output",  "",            "Override output directory")
 	dbPath     := flag.String("db",      "",            "Override database file path")
 	reset      := flag.Bool(  "reset",   false,         "Wipe database and output dir before running")
@@ -82,7 +87,7 @@ func main() {
 	if err := rootZone.Ensure(); err != nil {
 		log.Printf("rootzone: load failed (%v) — falling back to root servers", err)
 	}
-	resolver := NewResolver(cfg.DNS.MaxDepth, cfg.DNS.Retries, cfg.DNS.Timeout, rootZone)
+	resolver := NewResolver(cfg.DNS.MaxDepth, cfg.DNS.Retries, cfg.DNS.Timeout, rootZone, *debug)
 	rdap     := NewRDAPClient(cfg)
 	topn     := NewTopN(cfg)
 
@@ -185,6 +190,51 @@ func loadDomains(path string) []string {
 		if line == "" || strings.HasPrefix(line, "#") { continue }
 		domains = append(domains, strings.ToLower(line))
 	}
-	return domains
+	return shuffleByTLD(domains)
+}
+
+// shuffleByTLD groups domains by TLD and then interleaves them round-robin
+// so that consecutive domains are highly likely to belong to different TLDs.
+// This effectively disperses the load across different RDAP and DNS authoritative servers.
+func shuffleByTLD(domains []string) []string {
+	if len(domains) <= 1 {
+		return domains
+	}
+
+	// 1. Group domains into buckets by their TLD
+	buckets := make(map[string][]string)
+	for _, d := range domains {
+		tld := extractTLD(d)
+		buckets[tld] = append(buckets[tld], d)
+	}
+
+	// 2. Shuffle the domains inside each bucket and capture the bucket keys
+	var keys []string
+	for k, list := range buckets {
+		keys = append(keys, k)
+		rand.Shuffle(len(list), func(i, j int) { list[i], list[j] = list[j], list[i] })
+	}
+
+	// 3. Shuffle the order of the keys so the round-robin sequence is unpredictable
+	rand.Shuffle(len(keys), func(i, j int) { keys[i], keys[j] = keys[j], keys[i] })
+
+	// 4. Pop one domain from each bucket in a round-robin cycle until empty
+	out := make([]string, 0, len(domains))
+	for len(buckets) > 0 {
+		var nextKeys []string
+		for _, k := range keys {
+			list := buckets[k]
+			out = append(out, list[0]) // pop the first item
+			
+			if len(list) > 1 {
+				buckets[k] = list[1:]  // keep the rest for the next cycle
+				nextKeys = append(nextKeys, k)
+			} else {
+				delete(buckets, k)     // bucket is empty, discard it
+			}
+		}
+		keys = nextKeys
+	}
+	return out
 }
 

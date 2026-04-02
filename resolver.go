@@ -1,8 +1,10 @@
 // File    : resolver.go
-// Version : 1.3.0
-// Modified: 2026-04-01 18:15 UTC
+// Version : 1.5.0
+// Modified: 2026-04-02 10:15 UTC
 //
 // Changes:
+//   v1.5.0 - 2026-04-02 - Rename verbose flag to debug for iterative tracing
+//   v1.4.0 - 2026-04-02 - Add verbose tracing to iterative DNS resolution
 //   v1.3.0 - 2026-04-01 - Add SOA check to fix "no referral", add CNAME checking, TCP fallback for glueless NS
 //   v1.2.0 - 2026-04-01 - Root zone integration: skip root hop for known TLDs;
 //                          fast NXDOMAIN on unknown TLDs; extractTLD moved to apex.go
@@ -18,6 +20,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
 	"net"
 	"strings"
@@ -76,16 +79,18 @@ type Resolver struct {
 	udp      *dns.Client // primary transport
 	tcp      *dns.Client // fallback for truncated UDP responses
 	rootZone *RootZone   // optional; nil disables root zone optimisation
+	debug    bool        // enable detailed trace logging
 }
 
 // NewResolver creates a Resolver with the given settings.
-func NewResolver(maxDepth, retries int, timeout time.Duration, rz *RootZone) *Resolver {
+func NewResolver(maxDepth, retries int, timeout time.Duration, rz *RootZone, debug bool) *Resolver {
 	return &Resolver{
 		maxDepth: maxDepth,
 		retries:  retries,
 		udp:      &dns.Client{Net: "udp", Timeout: timeout},
 		tcp:      &dns.Client{Net: "tcp", Timeout: timeout * 2},
 		rootZone: rz,
+		debug:    debug,
 	}
 }
 
@@ -155,28 +160,51 @@ func (r *Resolver) CheckDomain(apex string) *ResolveResult {
 // cache has glue), following NS referrals at each level, until it gets an
 // authoritative answer for name/qtype.
 func (r *Resolver) iterativeResolve(name string, qtype uint16) (*dns.Msg, error) {
+	if r.debug {
+		log.Printf("dns-trace [%s|%s]: starting iterative resolution", name, dns.TypeToString[qtype])
+	}
+
 	servers, err := r.startingServers(name)
 	if err != nil {
+		if r.debug {
+			log.Printf("dns-trace [%s|%s]: no starting servers (unknown TLD): %v", name, dns.TypeToString[qtype], err)
+		}
 		return nil, err // unknown TLD
 	}
 
 	cnameHops := 0
 	for depth := 0; depth < r.maxDepth; depth++ {
+		if r.debug {
+			log.Printf("dns-trace [%s|%s]: depth %d, querying servers: %v", name, dns.TypeToString[qtype], depth, servers)
+		}
+
 		resp, err := r.query(name, qtype, servers)
 		if err != nil {
+			if r.debug {
+				log.Printf("dns-trace [%s|%s]: query failed at depth %d: %v", name, dns.TypeToString[qtype], depth, err)
+			}
 			return nil, err
 		}
 
 		switch resp.Rcode {
 		case dns.RcodeNameError: // NXDOMAIN
+			if r.debug {
+				log.Printf("dns-trace [%s|%s]: received NXDOMAIN at depth %d", name, dns.TypeToString[qtype], depth)
+			}
 			return nil, &NXDomainError{Name: name}
 		case dns.RcodeServerFailure:
+			if r.debug {
+				log.Printf("dns-trace [%s|%s]: received SERVFAIL at depth %d", name, dns.TypeToString[qtype], depth)
+			}
 			return nil, fmt.Errorf("SERVFAIL for %s (all authoritative servers failed)", name)
 		}
 
 		if len(resp.Answer) > 0 {
 			if qtype != dns.TypeCNAME {
 				if target := extractCNAMETarget(resp); target != "" {
+					if r.debug {
+						log.Printf("dns-trace [%s|%s]: followed CNAME to %s", name, dns.TypeToString[qtype], target)
+					}
 					if cnameHops >= 8 {
 						return nil, fmt.Errorf("CNAME chain too deep for %s", name)
 					}
@@ -190,6 +218,9 @@ func (r *Resolver) iterativeResolve(name string, qtype uint16) (*dns.Msg, error)
 					continue
 				}
 			}
+			if r.debug {
+				log.Printf("dns-trace [%s|%s]: successfully resolved", name, dns.TypeToString[qtype])
+			}
 			return resp, nil
 		}
 
@@ -197,22 +228,39 @@ func (r *Resolver) iterativeResolve(name string, qtype uint16) (*dns.Msg, error)
 		// Or if it contains an SOA record in Authority section, it's a terminal response.
 		// (Many DNS servers return NXDOMAIN/NODATA without AA=true but with an SOA)
 		if resp.Authoritative || hasSOA(resp) {
+			if r.debug {
+				log.Printf("dns-trace [%s|%s]: reached terminal NODATA/SOA response at depth %d", name, dns.TypeToString[qtype], depth)
+			}
 			return resp, nil
 		}
 
 		// Non-authoritative, no Answer → NS referral.
 		nsNames := extractNSNames(resp)
 		if len(nsNames) == 0 {
+			if r.debug {
+				log.Printf("dns-trace [%s|%s]: dead end - no referral and no answer at depth %d", name, dns.TypeToString[qtype], depth)
+			}
 			return nil, fmt.Errorf("no referral at depth %d for %s", depth, name)
 		}
+		
 		glue := extractGlue(resp)
+		if r.debug {
+			log.Printf("dns-trace [%s|%s]: depth %d, got referral to NS %v with %d glue records", name, dns.TypeToString[qtype], depth, nsNames, len(glue))
+		}
+
 		ips := r.resolveNStoIPs(nsNames, glue)
 		if len(ips) == 0 {
+			if r.debug {
+				log.Printf("dns-trace [%s|%s]: failed to resolve IPs for NS %v at depth %d", name, dns.TypeToString[qtype], nsNames, depth)
+			}
 			return nil, fmt.Errorf("cannot resolve NS IPs at depth %d for %s", depth, name)
 		}
 		servers = addPort(ips, "53")
 	}
 
+	if r.debug {
+		log.Printf("dns-trace [%s|%s]: max depth exceeded", name, dns.TypeToString[qtype])
+	}
 	return nil, fmt.Errorf("max delegation depth %d exceeded for %s", r.maxDepth, name)
 }
 
@@ -288,6 +336,9 @@ func (r *Resolver) resolveNStoIPs(names []string, glue map[string][]string) []st
 
 	for _, name := range names[:limit] {
 		if addrs, ok := glue[name]; ok {
+			if r.debug {
+				log.Printf("dns-trace: using glue records for NS %s: %v", name, addrs)
+			}
 			for _, ip := range addrs {
 				if !seen[ip] {
 					ips = append(ips, ip)
@@ -298,6 +349,9 @@ func (r *Resolver) resolveNStoIPs(names []string, glue map[string][]string) []st
 		}
 		
 		// Glueless — ask a public recursive resolver for NS hostname A records.
+		if r.debug {
+			log.Printf("dns-trace: glueless delegation for NS %s, falling back to public resolvers", name)
+		}
 		for _, pub := range publicFallbackResolvers {
 			m := new(dns.Msg)
 			m.SetQuestion(dns.Fqdn(name), dns.TypeA)
