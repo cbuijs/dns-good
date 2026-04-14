@@ -1,5 +1,11 @@
 # dns-good
 
+---
+
+NOTE: THIS IS STILL UNDER DEVELOPMENT AND MORE OF A TEST-CASE THEN ANYTHING ELSE. USE AT OWN RISK!
+
+--- 
+
 A self-contained DNS domain validation engine with a persistent repository.
 It cross-references multiple data sources to determine whether a domain is
 genuinely active, and keeps that knowledge fresh over time without hammering
